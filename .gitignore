@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+*.whl
+.venv/
+.ruff_cache/
+
+# Node / frontend build tooling (dev-time only; not part of the shipped
+# package - the prebuilt output lives in imfusion_tensorboard_viewer/static/
+# and *is* committed). Note: `dist/` above (no leading slash) already matches
+# frontend/imfusion-viewer-plugin/dist/ too, at any depth.
+frontend/imfusion-viewer-plugin/node_modules/
+frontend/imfusion-viewer-plugin/tsconfig.tsbuildinfo
+
+# Demo / scratch data
+demo_logdir/
+
+# OS cruft
+.DS_Store

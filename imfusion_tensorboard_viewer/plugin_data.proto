@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package tensorboard.imfusion_viewer;
+
+enum LayerKind {
+  UNKNOWN = 0;
+  VOLUME = 1;
+  MASK = 2;
+  MESH = 3;
+  IMAGE_2D = 4;
+}
+
+message ImFusionLayerPluginData {
+  int32 version = 1;
+  string case_name = 2;
+  string layer_name = 3;
+  LayerKind kind = 4;
+  string file_extension = 5;
+  bool zlib_compressed = 6;
+  string display_name = 7;
+  repeated float default_color = 8;
+  float default_opacity = 9;
+  bool default_visible = 10;
+  int32 order = 11;
+  string json_extra = 12;
+}

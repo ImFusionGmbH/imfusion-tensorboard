@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "imfusion-tensorboard"
+version = "0.1.1"
+description = "TensorBoard plugin for viewing ImFusion spatial training outputs (volumes, segmentation masks, meshes, 2D images) organized as named cases and layers, rendered via ImFusion's WebSDK."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "LicenseRef-Proprietary"
+authors = [
+    { name = "ImFusion GmbH" },
+]
+classifiers = [
+    "Private :: Do Not Upload",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Framework :: TensorBoard",
+]
+dependencies = [
+    "tensorboard>=2.0",
+    "protobuf>=7.35.0",
+    "numpy>=1.24",
+    "nibabel>=5.0",
+]
+
+[project.entry-points."tensorboard_plugins"]
+imfusion_viewer = "imfusion_tensorboard_viewer.plugin:ImFusionViewerPlugin"
+
+[tool.setuptools]
+packages = ["imfusion_tensorboard_viewer"]
+include-package-data = false
+
+[tool.setuptools.package-data]
+imfusion_tensorboard_viewer = ["static/*", "static/**/*"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+exclude = [
+    ".venv",
+    "demo_logdir",
+    "frontend",
+    "*_pb2.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+ignore = [
+    "E501",
+]

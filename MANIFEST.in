@@ -1,0 +1,9 @@
+# Ensures a source distribution (sdist) built from this project includes
+# everything needed to rebuild the wheel, in addition to what setuptools
+# already gathers automatically from [tool.setuptools.package-data] in
+# pyproject.toml (which governs the *wheel*). Not strictly required for the
+# wheel itself, but keeps `python -m build --sdist` correct/complete too.
+include README.md
+include pyproject.toml
+include imfusion_tensorboard_viewer/plugin_data.proto
+recursive-include imfusion_tensorboard_viewer/static *
