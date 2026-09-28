@@ -90,13 +90,14 @@ class CaseWriter:
           kind: A `LayerKind` value: int, enum name string, or enum value.
           file_extension: File extension (with leading dot), e.g. ".nii".
           compress: If True (default), zlib-compress `data` before writing.
-          color: Default RGBA (or RGB) color. Only meaningful for the
+          color: Default RGB color. Only meaningful for the
             single-value mask path (`kind="MASK"` with no `label_names`);
             ignored when `label_names` is given. If left `None` for such a
             mask, a color is auto-picked from the same palette used for
             `label_names`, indexed by `order`; otherwise defaults to opaque
             white.
-          opacity: Default opacity for rendering this layer.
+          opacity: Unsupported, leave at 1.0 (3D renders it as a paler
+            color, not transparency).
           visible: Whether this layer should be visible by default.
           order: Sort order among layers of the same case.
           wall_time: Optional wall-clock time for this event; defaults to

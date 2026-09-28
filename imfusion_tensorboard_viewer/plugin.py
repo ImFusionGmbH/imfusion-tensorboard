@@ -9,7 +9,7 @@ import zlib
 
 import nibabel as nib
 import numpy as np
-from tensorboard import errors, plugin_util
+from tensorboard import context, errors, plugin_util
 from tensorboard.backend import http_util
 from tensorboard.data import provider
 from tensorboard.plugins import base_plugin
@@ -105,7 +105,9 @@ class ImFusionViewerPlugin(base_plugin.TBPlugin):
         if self._data_provider is None:
             return False
         try:
+            # No request here; newer TensorBoard rejects ctx=None.
             mapping = self._data_provider.list_blob_sequences(
+                context.RequestContext(),
                 experiment_id="",
                 plugin_name=metadata.PLUGIN_NAME,
             )

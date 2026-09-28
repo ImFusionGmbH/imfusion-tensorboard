@@ -83,7 +83,7 @@ for epoch in range(num_epochs):
                 "data": mask_nifti_bytes,
                 "kind": "MASK",
                 "file_extension": ".nii",
-                "color": (1, 0, 0, 0.5),  # RGBA
+                "color": (1, 0, 0),  # RGB
             },
         },
     )
@@ -115,7 +115,7 @@ tensorboard --logdir <your_logdir> --samples_per_plugin imfusion_viewer=1000
   columns on the same case keep their 3D cameras linked (toggle **Link 3D
   cameras** to break it).
 - **Combine into one workspace** - overlay several runs' layers in one
-  column instead, each with its own color/opacity per layer, for direct
+  column instead, each with its own color per layer, for direct
   side-by-side comparison without a second window.
 - **Volume windowing and cross-section** - each volume gets an **Invert**
   toggle and **Auto Window** button (2D and 3D tracked independently), plus
