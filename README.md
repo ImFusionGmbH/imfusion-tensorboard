@@ -119,8 +119,8 @@ tensorboard --logdir <your_logdir> --samples_per_plugin imfusion_viewer=1000
   side-by-side comparison without a second window.
 - **Volume windowing and cross-section** - each volume gets an **Invert**
   toggle and **Auto Window** button (2D and 3D tracked independently), plus
-  a **Cross-section** control that cuts the volume away along X/Y/Z to
-  reveal a mask or mesh sitting inside it.
+  a **Cross-section** control that cuts the volume away along X/Y/Z in the
+  3D view (the 2D slices stay intact) to reveal a mask or mesh inside it.
 
 ![Cropping a volume in 3D, then toggling the ground-truth and predicted masks it reveals](docs/images/cross-section-mask-toggle.gif)
 
