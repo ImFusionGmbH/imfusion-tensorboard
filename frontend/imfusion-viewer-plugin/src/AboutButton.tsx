@@ -4,7 +4,7 @@ import { ImFusionMark } from './ImFusionMark';
 // Hand-maintained: bump alongside pyproject.toml's `version` field, since
 // there's no build-time injection linking them. This is the shipped plugin
 // version, not the frontend's unrelated package.json version.
-const PLUGIN_VERSION = '0.1.1';
+const PLUGIN_VERSION = '0.1.2';
 
 export interface AboutButtonProps {
   /**

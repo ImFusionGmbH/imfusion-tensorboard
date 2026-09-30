@@ -22,14 +22,15 @@ export function CollapsibleSection({ label, labelSuffix, defaultExpanded = true,
 
   return (
     <div style={sectionStyle}>
-      <button type="button" onClick={() => setExpanded((e) => !e)} style={headerButtonStyle}>
+      <button type="button" onClick={() => setExpanded((e) => !e)} style={headerButtonStyle} aria-expanded={expanded}>
         <span style={disclosureStyle}>{expanded ? '▾' : '▸'}</span>
         <span style={headerLabelStyle}>
           {label}
           {labelSuffix ?? ''}
         </span>
       </button>
-      {expanded && <div style={bodyStyle}>{children}</div>}
+      {/* Hidden, not unmounted: children may host portal targets (see CaseBrowser). */}
+      <div style={expanded ? bodyStyle : hiddenStyle}>{children}</div>
     </div>
   );
 }
@@ -37,6 +38,8 @@ export function CollapsibleSection({ label, labelSuffix, defaultExpanded = true,
 const sectionStyle: CSSProperties = {
   display: 'flex',
   flexDirection: 'column',
+  // The sidebar is the one scroll container; sections never shrink into inner scrollers.
+  flexShrink: 0,
   gap: 8,
   padding: '4px 10px 12px',
   borderTop: '1px solid var(--tb-border)',
@@ -72,4 +75,8 @@ const bodyStyle: CSSProperties = {
   display: 'flex',
   flexDirection: 'column',
   gap: 14,
+};
+
+const hiddenStyle: CSSProperties = {
+  display: 'none',
 };

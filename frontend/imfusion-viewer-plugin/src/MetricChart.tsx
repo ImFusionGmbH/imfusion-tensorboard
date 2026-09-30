@@ -22,11 +22,18 @@ export interface MetricChartProps {
   height?: number;
 }
 
+/** Compact number formatting that keeps small magnitudes (e.g. learning rates) readable. */
+function formatMetricValue(v: number): string {
+  if (!Number.isFinite(v)) return String(v);
+  if (v === 0) return '0';
+  const abs = Math.abs(v);
+  if (abs >= 1e5 || abs < 1e-3) return v.toExponential(2);
+  return String(Number(v.toPrecision(4)));
+}
+
 /**
  * Inline-SVG line chart for a single scalar tag, overlaying one line per
- * checked run. Colors come from the shared per-run assignment in
- * runColors.ts so they match the sidebar's run swatches; no separate legend
- * is drawn here.
+ * checked run in its runColors.ts color. The run legend lives in DockedMetrics.
  */
 export function MetricChart({ tag, series, currentStep = null, width = 320, height = 160 }: MetricChartProps) {
   // `padding`/`topPadding` size the margin around the axis-label text below.
@@ -71,8 +78,17 @@ export function MetricChart({ tag, series, currentStep = null, width = 320, heig
             <g key={run}>
               {points.length > 1 && <path d={path} fill="none" stroke={color} strokeWidth={2} />}
               {points.map((p) => (
-                <circle key={p.step} cx={x(p.step)} cy={y(p.value)} r={p === latest ? 3 : 1.5} fill={color}>
-                  <title>{`${run} · epoch ${p.step} · ${tag} ${p.value.toFixed(4)}`}</title>
+                // Transparent stroke widens the hover target for the tooltip.
+                <circle
+                  key={p.step}
+                  cx={x(p.step)}
+                  cy={y(p.value)}
+                  r={p === latest ? 3 : 1.5}
+                  fill={color}
+                  stroke="transparent"
+                  strokeWidth={8}
+                >
+                  <title>{`${run} · epoch ${p.step} · ${tag} ${formatMetricValue(p.value)}`}</title>
                 </circle>
               ))}
             </g>
@@ -95,7 +111,9 @@ export function MetricChart({ tag, series, currentStep = null, width = 320, heig
           epoch {maxStep}
         </text>
         <text x={padding} y={topPadding - 10} fontSize={15} fill="var(--tb-text-muted)">
-          {minV.toFixed(3)}–{maxV.toFixed(3)}
+          {rawMin === rawMax
+            ? formatMetricValue(rawMin)
+            : `min ${formatMetricValue(rawMin)} · max ${formatMetricValue(rawMax)}`}
         </text>
       </svg>
     </div>

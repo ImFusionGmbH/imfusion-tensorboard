@@ -6,6 +6,7 @@
 """Framework-agnostic writer for imfusion_viewer per-case, per-layer data."""
 
 import json
+import numbers
 import time
 import zlib
 
@@ -109,7 +110,8 @@ class CaseWriter:
             proto field); passing more than one raises `ValueError`.
           label_names: For multi-class `kind="MASK"` layers: a dict mapping
             each integer pixel/label value to a display name, e.g.
-            `{1: "liver", 2: "tumor", 3: "vessel"}`. JSON-encoded into
+            `{1: "liver", 2: "tumor", 3: "vessel"}`; 0 is background and
+            never drawn. JSON-encoded into
             `json_extra`; the frontend then auto-assigns each label value
             its own color from a fixed palette, so don't also pass
             `color=`. Mutually exclusive with an explicit `json_extra`.
@@ -130,10 +132,15 @@ class CaseWriter:
                 "when using multi-class labels."
             )
 
+        if label_names is not None:
+            bad = [v for v in label_names if isinstance(v, bool) or not isinstance(v, numbers.Integral)]
+            if bad:
+                raise ValueError(f"write_layer: `label_names` keys must be integers, got {bad!r}")
+
         extra_payload = None
         if label_names is not None:
             extra_payload = {
-                "labels": {str(value): name for value, name in label_names.items()}
+                "labels": {str(int(value)): name for value, name in label_names.items()}
             }
         elif label_value != 1:
             extra_payload = {"labelValue": label_value}

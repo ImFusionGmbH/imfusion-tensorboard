@@ -3,8 +3,12 @@
 # TensorBoard backend plugin for imfusion_viewer.
 """The imfusion_viewer TensorBoard plugin."""
 
+import gzip
+import json
 import logging
+import math
 import os
+import struct
 import zlib
 
 import nibabel as nib
@@ -32,24 +36,44 @@ _STATIC_DIR_NAME = "static"
 _INDEX_JS_FILENAME = "index.js"
 _WASM_FILENAME = "ImFusionLib.wasm"
 
-# Non-overlapping label-value range per merged run in /combined_layer_data;
-# must match the frontend's own constant.
-_COMBINED_LABEL_OFFSET_STEP = 1000
-
 # /layer_data's crop_axis indexes a volume's own i/j/k storage axes, not a
 # world-space direction.
 _CROP_AXES = {"x": 0, "y": 1, "z": 2}
 
 
+class _NotNiftiError(ValueError):
+    """The blob isn't a (optionally gzipped) NIfTI-1/2 volume."""
+
+
+def _nifti_from_bytes(raw):
+    """Parses raw NIfTI-1 or NIfTI-2 bytes (sizeof_hdr 348 / 540, either endianness)."""
+    if len(raw) >= 4:
+        for fmt in ("<i", ">i"):
+            (sizeof_hdr,) = struct.unpack(fmt, raw[:4])
+            if sizeof_hdr == 348:
+                return nib.Nifti1Image.from_bytes(raw)
+            if sizeof_hdr == 540:
+                return nib.Nifti2Image.from_bytes(raw)
+    raise _NotNiftiError("not a NIfTI volume")
+
+
 def _crop_volume_blob(blob, compressed, axis, position):
-    """Zeroes voxels beyond `position` (0..1 fraction, 1 = uncropped) along
-    one storage axis, for a 3D cross-section - the WebSDK has no clip-plane
-    API, so this edits the voxel data server-side instead. Cropped voxels
-    are set to the volume's own minimum intensity, not a fixed 0.
+    """Sets voxels beyond `position` (0..1 fraction, 1 = uncropped) along one
+    storage axis to the volume's minimum, for a 3D cross-section - the WebSDK
+    has no clip-plane API, so this edits the voxel data server-side instead.
+    Raises `_NotNiftiError` for anything but NIfTI (.nii / .nii.gz).
     """
     raw = zlib.decompress(blob) if compressed else bytes(blob)
-    img = nib.Nifti1Image.from_bytes(raw)
-    arr = np.array(img.dataobj)  # a real (writable) copy, not a lazy proxy
+    gzipped = raw[:2] == b"\x1f\x8b"
+    if gzipped:
+        raw = gzip.decompress(raw)
+    img = _nifti_from_bytes(raw)
+    arr = np.array(img.dataobj)  # scaled by scl_slope/scl_inter, writable copy
+    header = img.header.copy()
+    if getattr(img.dataobj, "slope", 1.0) != 1.0 or getattr(img.dataobj, "inter", 0.0) != 0.0:
+        # Saving scaled values into the scaled on-disk int type would re-quantize them.
+        arr = arr.astype(np.float32)
+        header.set_data_dtype(np.float32)
     axis_idx = _CROP_AXES[axis]
     if axis_idx >= arr.ndim:
         raise ValueError(f"axis {axis!r} out of range for a {arr.ndim}D volume")
@@ -58,9 +82,38 @@ def _crop_volume_blob(blob, compressed, axis, position):
     slicer = [slice(None)] * arr.ndim
     slicer[axis_idx] = slice(cutoff + 1, None)
     arr[tuple(slicer)] = arr.min()
-    cropped = nib.Nifti1Image(arr, img.affine, img.header)
-    out = cropped.to_bytes()
+    out = type(img)(arr, img.affine, header).to_bytes()
+    if gzipped:
+        out = gzip.compress(out, compresslevel=1)
     return zlib.compress(out) if compressed else out
+
+
+def _declared_label_values(json_extra):
+    """A mask layer's label values, ascending: integer, non-zero keys of
+    `json_extra`'s "labels", else its "labelValue" (default 1). Must match
+    CaseViewer.tsx's `labelEntries`, which colours the merged labels.
+    """
+    try:
+        extra = json.loads(json_extra or "{}")
+    except ValueError:
+        extra = {}
+    if not isinstance(extra, dict):
+        extra = {}
+    labels = extra.get("labels")
+    if isinstance(labels, dict) and labels:
+        values = set()
+        for key in labels:
+            try:
+                value = float(key)
+            except (TypeError, ValueError):
+                continue
+            if value.is_integer() and value != 0:
+                values.add(int(value))
+        return sorted(values)
+    value = extra.get("labelValue")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        value = 1
+    return [int(value)] if float(value).is_integer() and value != 0 else []
 
 
 class ImFusionViewerPlugin(base_plugin.TBPlugin):
@@ -254,6 +307,23 @@ class ImFusionViewerPlugin(base_plugin.TBPlugin):
             ctx, blob_key=datum.values[0].blob_key
         )
 
+    def _read_layer_json_extra(self, ctx, experiment, run, case, layer):
+        """The layer's `json_extra` metadata string. Raises `LookupError` if
+        the layer doesn't exist."""
+        tag = metadata.get_tag(case, layer)
+        mapping = self._data_provider.list_blob_sequences(
+            ctx,
+            experiment_id=experiment,
+            plugin_name=metadata.PLUGIN_NAME,
+            run_tag_filter=provider.RunTagFilter(runs=[run], tags=[tag]),
+        )
+        time_series = mapping.get(run, {}).get(tag)
+        if time_series is None:
+            raise LookupError(
+                f"No layer for run={run!r}, case={case!r}, layer={layer!r}"
+            )
+        return metadata.parse_plugin_metadata(time_series.plugin_content).json_extra
+
     @wrappers.Request.application
     def _serve_layer_data(self, request):
         ctx = plugin_util.context(request.environ)
@@ -308,6 +378,14 @@ class ImFusionViewerPlugin(base_plugin.TBPlugin):
             compressed = request.args.get("compressed") != "false"
             try:
                 blob = _crop_volume_blob(blob, compressed, crop_axis, crop_position)
+            except _NotNiftiError as e:
+                return http_util.Respond(
+                    request,
+                    f"Can't crop layer {layer!r} ({e}): cross-section only "
+                    "supports NIfTI volumes (.nii / .nii.gz)",
+                    "text/plain",
+                    code=400,
+                )
             except Exception as e:
                 return http_util.Respond(
                     request,
@@ -320,15 +398,19 @@ class ImFusionViewerPlugin(base_plugin.TBPlugin):
 
     @wrappers.Request.application
     def _serve_combined_layer_data(self, request):
-        """Merges several (run, layer) mask volumes into ONE combined NIfTI
-        label volume (the WebSDK's 3D view can only render one LABEL
-        SharedImageSet at a time, so every contributing pair must land in a
-        single object, not one merged object per layer name).
+        """Merges several (run, layer) mask volumes into ONE NIfTI label
+        volume (the WebSDK's 3D view renders only one LABEL SharedImageSet).
 
-        Query params: case, step, pairs (comma-separated `run:layer` tokens,
-        order matters - see `_COMBINED_LABEL_OFFSET_STEP`), compressed.
-        Later pairs win where masks overlap. Returns a zlib-compressed NIfTI
-        blob, or 409 if the volumes don't share a voxel grid.
+        Query params: case, step, pairs (comma-separated `run:layer` tokens),
+        compressed, and optional labels (one `;`-separated entry per pair, each
+        a comma-separated list of that pair's label values to keep). Labels are
+        renumbered to compact ids 1..N: pairs in the given order, each pair's
+        kept values (default: its declared values, see
+        `_declared_label_values`) ascending; other values drop to 0.
+        CaseViewer.tsx's `styleMerged` numbers them the same way. uint8 if
+        N < 256, else uint16. Later pairs win where masks overlap (the
+        frontend shows this volume in 3D only). Returns a zlib-compressed
+        NIfTI blob, or 409 if the volumes don't share a voxel grid.
         """
         ctx = plugin_util.context(request.environ)
         experiment = plugin_util.experiment_id(request.environ)
@@ -369,19 +451,37 @@ class ImFusionViewerPlugin(base_plugin.TBPlugin):
                 "text/plain", code=400,
             )
         compressed = compressed_str != "false"
+        # Hidden labels are left out, so they can't overwrite visible ones.
+        kept = None
+        labels_str = request.args.get("labels")
+        if labels_str is not None:
+            entries = labels_str.split(";")
+            if len(entries) != len(pairs):
+                return http_util.Respond(
+                    request, "labels must have one entry per pair", "text/plain", code=400
+                )
+            try:
+                kept = [sorted({int(v) for v in e.split(",") if v}) for e in entries]
+            except ValueError:
+                return http_util.Respond(
+                    request, "labels must be integers", "text/plain", code=400
+                )
 
         images = []
+        label_values = []
         for run, layer in pairs:
             try:
                 blob = self._read_layer_blob(ctx, experiment, run, case, layer, step)
+                json_extra = self._read_layer_json_extra(ctx, experiment, run, case, layer)
             except errors.PublicError as e:
                 return http_util.Respond(request, str(e), "text/plain", code=400)
             except LookupError as e:
                 return http_util.Respond(request, str(e), "text/plain", code=404)
-            if compressed:
-                blob = zlib.decompress(blob)
+            raw = zlib.decompress(blob) if compressed else bytes(blob)
             try:
-                images.append(nib.Nifti1Image.from_bytes(bytes(blob)))
+                if raw[:2] == b"\x1f\x8b":
+                    raw = gzip.decompress(raw)
+                images.append(_nifti_from_bytes(raw))
             except Exception as e:
                 return http_util.Respond(
                     request,
@@ -390,6 +490,10 @@ class ImFusionViewerPlugin(base_plugin.TBPlugin):
                     "text/plain",
                     code=400,
                 )
+            declared = _declared_label_values(json_extra)
+            label_values.append(
+                declared if kept is None else [v for v in kept[len(label_values)] if v in declared]
+            )
 
         reference = images[0]
         for (run, layer), img in zip(pairs[1:], images[1:]):
@@ -406,15 +510,23 @@ class ImFusionViewerPlugin(base_plugin.TBPlugin):
                     code=409,
                 )
 
-        combined = np.zeros(reference.shape, dtype=np.int32)
-        for i, img in enumerate(images):
-            arr = np.asarray(img.dataobj)
-            offset = i * _COMBINED_LABEL_OFFSET_STEP
-            nonzero = arr > 0
-            # Later pairs overwrite earlier ones on overlap.
-            combined[nonzero] = arr[nonzero].astype(np.int32) + offset
+        total = sum(len(values) for values in label_values)
+        if total > np.iinfo(np.uint16).max:
+            return http_util.Respond(
+                request, f"Too many labels to merge ({total})", "text/plain", code=400
+            )
+        dtype = np.uint8 if total < 256 else np.uint16
+        combined = np.zeros(reference.shape, dtype=dtype)
+        next_id = 1
+        for img, values in zip(images, label_values):
+            arr = np.asanyarray(img.dataobj)
+            for value in values:
+                # Later pairs overwrite earlier ones on overlap.
+                combined[arr == value] = next_id
+                next_id += 1
 
         merged = nib.Nifti1Image(combined, reference.affine)
+        merged.header.set_xyzt_units("mm")  # else the SDK warns per load
         payload = merged.to_bytes()
         payload = zlib.compress(payload)
         return http_util.Respond(request, payload, "application/octet-stream")

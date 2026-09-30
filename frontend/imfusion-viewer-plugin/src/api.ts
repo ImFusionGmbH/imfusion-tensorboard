@@ -104,16 +104,42 @@ export async function fetchLicenseToken(): Promise<string | null> {
   if (!res.ok) {
     throw new Error(`Failed to fetch ./license_token: ${res.status} ${res.statusText}`);
   }
-  return ((await res.json()) as LicenseTokenResponse).license_token;
+  const token = ((await res.json()) as LicenseTokenResponse).license_token;
+  // Env values from CRLF .env files or mounted secrets can carry whitespace.
+  return typeof token === 'string' ? token.trim() || null : null;
 }
 
-export async function fetchCases(): Promise<CasesResponse> {
+// Every poller (CaseBrowser, each CaseViewer) shares one in-flight request and a short-lived result.
+const CASES_TTL_MS = 1500;
+let casesInFlight: Promise<CasesResponse> | null = null;
+let casesCache: { text: string; result: CasesResponse; at: number } | null = null;
+
+/** Coalesced `./cases`. Returns the same object while the response is unchanged; callers must not mutate it. */
+export function fetchCases(): Promise<CasesResponse> {
+  if (casesInFlight) return casesInFlight;
+  if (casesCache && performance.now() - casesCache.at < CASES_TTL_MS) return Promise.resolve(casesCache.result);
+  casesInFlight = fetchCasesUncached().finally(() => {
+    casesInFlight = null;
+  });
+  return casesInFlight;
+}
+
+async function fetchCasesUncached(): Promise<CasesResponse> {
   const res = await fetch('./cases');
   if (!res.ok) {
     throw new Error(`Failed to fetch ./cases: ${res.status} ${res.statusText}`);
   }
-  const raw = (await res.json()) as RawCasesResponse;
+  const text = await res.text();
+  if (casesCache && casesCache.text === text) {
+    casesCache.at = performance.now();
+    return casesCache.result;
+  }
+  const result = parseCases(JSON.parse(text) as RawCasesResponse);
+  casesCache = { text, result, at: performance.now() };
+  return result;
+}
 
+function parseCases(raw: RawCasesResponse): CasesResponse {
   const result: CasesResponse = {};
   for (const [run, cases] of Object.entries(raw)) {
     result[run] = {};
@@ -161,7 +187,7 @@ export class LayerFetchError extends Error {
 }
 
 /** Fetches one layer's raw bytes, decompressing with pako if flagged compressed. */
-export async function fetchLayerData(params: FetchLayerDataParams): Promise<ArrayBuffer> {
+export async function fetchLayerData(params: FetchLayerDataParams, signal?: AbortSignal): Promise<ArrayBuffer> {
   const qs = new URLSearchParams({
     run: params.run,
     case: params.case,
@@ -174,7 +200,7 @@ export async function fetchLayerData(params: FetchLayerDataParams): Promise<Arra
     // Only needed server-side when it must decompress/crop/recompress.
     qs.set('compressed', String(params.compressed));
   }
-  const res = await fetch(`./layer_data?${qs.toString()}`);
+  const res = await fetch(`./layer_data?${qs.toString()}`, { signal });
   if (!res.ok) {
     throw new LayerFetchError(
       `Failed to fetch layer_data for "${params.layer}" @ step ${params.step}: ${res.status} ${res.statusText}`,
@@ -189,14 +215,11 @@ export async function fetchLayerData(params: FetchLayerDataParams): Promise<Arra
   return inflated.buffer.slice(inflated.byteOffset, inflated.byteOffset + inflated.byteLength) as ArrayBuffer;
 }
 
-// Must match the backend's `_COMBINED_LABEL_OFFSET_STEP` exactly.
-export const COMBINED_LABEL_OFFSET_STEP = 1000;
-
 export interface FetchCombinedLayerDataParams {
   case: string;
   step: number;
-  /** Every (run, layer) mask contributing to this merged volume, in order (index i -> label offset i * COMBINED_LABEL_OFFSET_STEP). */
-  pairs: Array<{ run: string; layer: string }>;
+  /** Contributing masks and the label values kept from each; labels come back renumbered 1..N (pairs in order, values ascending). */
+  pairs: Array<{ run: string; layer: string; labels: number[] }>;
   /** Whether every pair's own blob is zlib-compressed (shared across all of them). */
   compressed: boolean;
 }
@@ -210,14 +233,18 @@ export class GridMismatchError extends Error {
 }
 
 /** Fetches every listed mask already merged server-side into one label volume (see `plugin.py`'s `_serve_combined_layer_data`). */
-export async function fetchCombinedLayerData(params: FetchCombinedLayerDataParams): Promise<ArrayBuffer> {
+export async function fetchCombinedLayerData(
+  params: FetchCombinedLayerDataParams,
+  signal?: AbortSignal,
+): Promise<ArrayBuffer> {
   const qs = new URLSearchParams({
     case: params.case,
     step: String(params.step),
     pairs: params.pairs.map((p) => `${p.run}:${p.layer}`).join(','),
+    labels: params.pairs.map((p) => p.labels.join(',')).join(';'),
     compressed: String(params.compressed),
   });
-  const res = await fetch(`./combined_layer_data?${qs.toString()}`);
+  const res = await fetch(`./combined_layer_data?${qs.toString()}`, { signal });
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
     if (res.status === 409) throw new GridMismatchError(text);
@@ -234,18 +261,20 @@ export interface ScalarPoint {
   value: number;
 }
 
-/** Calls TensorBoard's built-in scalar-plugin route, one level up from this plugin's own base path. */
-export async function fetchScalarTags(run: string): Promise<string[]> {
+/** run -> scalar tags, from TensorBoard's built-in scalar-plugin route (one level up from this plugin's base path). */
+export async function fetchAllScalarTags(): Promise<Record<string, string[]>> {
   const experiment = new URLSearchParams(window.location.search).get('experiment');
   const qs = new URLSearchParams();
   if (experiment) qs.set('experiment', experiment);
   const suffix = qs.toString() ? `?${qs.toString()}` : '';
   const res = await fetch(`./../scalars/tags${suffix}`);
   if (!res.ok) {
-    throw new Error(`Failed to fetch scalar tags for run "${run}": ${res.status} ${res.statusText}`);
+    throw new Error(`Failed to fetch scalar tags: ${res.status} ${res.statusText}`);
   }
   const raw = (await res.json()) as Record<string, Record<string, { displayName: string; description: string }>>;
-  return Object.keys(raw[run] ?? {});
+  const result: Record<string, string[]> = {};
+  for (const [run, tags] of Object.entries(raw)) result[run] = Object.keys(tags);
+  return result;
 }
 
 export async function fetchScalars(run: string, tag: string): Promise<ScalarPoint[]> {

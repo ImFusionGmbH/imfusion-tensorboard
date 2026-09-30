@@ -21,13 +21,11 @@ export interface DockedMetricsProps {
 /**
  * Collapsible metrics section in the sidebar, mounted independently of the
  * viewer columns so comparisons stay live even when columns are hidden.
- * Reuses `useMetricsData` computed once in App.tsx instead of polling again
- * here. No separate legend is drawn; the sidebar's own run checkboxes and
- * swatches already serve that purpose.
+ * Reuses `useMetricsData` computed once in App.tsx instead of polling again.
  */
 export function DockedMetrics({ data, currentStep = null }: DockedMetricsProps) {
   const [expanded, setExpanded] = useState(true);
-  const { status, error, groups, seriesForTag } = data;
+  const { status, error, groups, legend, seriesForTag } = data;
 
   const tagCount = groups.reduce((n, g) => n + g.tags.length, 0);
 
@@ -44,6 +42,16 @@ export function DockedMetrics({ data, currentStep = null }: DockedMetricsProps) 
           {status === 'loading' && <div style={emptyStyle}>Looking for scalar data…</div>}
           {status === 'error' && <div style={errorStyle}>{error}</div>}
           {status === 'no-tags' && <div style={emptyStyle}>No scalar tags found for the checked run(s).</div>}
+          {status === 'ready' && legend.length > 0 && (
+            <div style={legendStyle}>
+              {legend.map(({ run, color }) => (
+                <span key={run} style={legendItemStyle} title={run}>
+                  <span style={{ ...legendSwatchStyle, background: color }} />
+                  <span style={legendLabelStyle}>{run}</span>
+                </span>
+              ))}
+            </div>
+          )}
           {status === 'ready' &&
             groups.map(({ group, tags }) => (
               <div key={group} style={groupStyle}>
@@ -70,6 +78,7 @@ export function DockedMetrics({ data, currentStep = null }: DockedMetricsProps) 
 const sectionStyle: CSSProperties = {
   display: 'flex',
   flexDirection: 'column',
+  flexShrink: 0,
   gap: 8,
   padding: '4px 10px 12px',
   borderTop: '1px solid var(--tb-border)',
@@ -120,6 +129,35 @@ const groupLabelStyle: CSSProperties = {
   textTransform: 'uppercase',
   letterSpacing: '0.03em',
   opacity: 0.4,
+};
+
+const legendStyle: CSSProperties = {
+  display: 'flex',
+  flexWrap: 'wrap',
+  gap: '4px 12px',
+  fontSize: 13,
+};
+
+const legendItemStyle: CSSProperties = {
+  display: 'inline-flex',
+  alignItems: 'center',
+  gap: 6,
+  minWidth: 0,
+  maxWidth: '100%',
+};
+
+// A short line segment, matching how the run is drawn in the charts.
+const legendSwatchStyle: CSSProperties = {
+  width: 14,
+  height: 3,
+  borderRadius: 2,
+  flexShrink: 0,
+};
+
+const legendLabelStyle: CSSProperties = {
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap',
 };
 
 // MetricChart's <svg> stretches to fill this wrapper's full width (see

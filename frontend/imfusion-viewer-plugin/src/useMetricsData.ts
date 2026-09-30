@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
-import { fetchScalars, fetchScalarTags, type ScalarPoint } from './api';
+import { fetchAllScalarTags, fetchScalars, type ScalarPoint } from './api';
 import type { MetricSeries } from './MetricChart';
 import type { RunColorEntry } from './runColors';
 
-// Same poll cadence as CaseViewer, so metrics track training live alongside
-// the epoch scrubber.
-const POLL_INTERVAL_MS = 2000;
+// Slow fallback cadence; new epochs trigger an immediate refresh via `revision`.
+// TensorBoard's scalars route has no "since step" parameter, so each refresh is a full fetch.
+const POLL_INTERVAL_MS = 10000;
 
 export interface TagGroup {
   group: string;
@@ -41,6 +41,22 @@ export function runsKeyOf(runs: RunColorEntry[]): string {
   return [...runs.map((r) => r.run)].sort().join('::');
 }
 
+function samePoints(a: ScalarPoint[] | undefined, b: ScalarPoint[]): boolean {
+  return (
+    a !== undefined &&
+    a.length === b.length &&
+    a.every((p, i) => p.step === b[i].step && p.value === b[i].value && p.wallTime === b[i].wallTime)
+  );
+}
+
+function sameTags(a: Record<string, string[]>, b: Record<string, string[]>): boolean {
+  const keys = Object.keys(b);
+  return (
+    Object.keys(a).length === keys.length &&
+    keys.every((k) => a[k] !== undefined && a[k].join('\n') === b[k].join('\n'))
+  );
+}
+
 /**
  * States a consumer of `useMetricsData` can render: no runs checked,
  * discovery still loading, a request failed, discovery finished with no
@@ -54,17 +70,19 @@ export interface UseMetricsDataResult {
   error: string | null;
   /** Only meaningful when `status === 'ready'`. */
   groups: TagGroup[];
+  /** The checked runs (with colors) that report at least one tag, for the legend. */
+  legend: RunColorEntry[];
   /** One entry per currently-checked run that reports `tag`, each carrying that run's points for it. */
   seriesForTag: (tag: string) => MetricSeries[];
 }
 
 /**
- * Data-fetching/polling core behind `DockedMetrics`. Discovers all scalar
- * tags for every checked run, then polls every (run, tag) pair together on
- * one shared interval, rather than each chart polling independently.
+ * Data-fetching/polling core behind `DockedMetrics`. Discovers tags and
+ * fetches every (run, tag) series together, on `revision` changes (pass
+ * something that changes when a run logs a new step) and on a slow interval.
  */
-export function useMetricsData(runs: RunColorEntry[]): UseMetricsDataResult {
-  // run -> tags that run reports (discovered independently; runs may differ).
+export function useMetricsData(runs: RunColorEntry[], revision = ''): UseMetricsDataResult {
+  // run -> tags that run reports (runs may differ).
   const [tagsByRun, setTagsByRun] = useState<Record<string, string[]>>({});
   // run -> tag -> points.
   const [pointsByRunTag, setPointsByRunTag] = useState<Record<string, Record<string, ScalarPoint[]>>>({});
@@ -72,18 +90,12 @@ export function useMetricsData(runs: RunColorEntry[]): UseMetricsDataResult {
 
   const runsKey = runsKeyOf(runs);
 
-  // Mirror latest `runs`/`tagsByRun` into refs so the poll interval doesn't
-  // need to be torn down and recreated on every discovery refresh.
   const runsRef = useRef<RunColorEntry[]>(runs);
-  const tagsByRunRef = useRef<Record<string, string[]>>({});
   useEffect(() => {
     runsRef.current = runs;
-    tagsByRunRef.current = tagsByRun;
   });
 
-  // Reset state synchronously during render (React's "adjusting state when a
-  // prop changes" pattern) when the checked-run set changes, so there's no
-  // flash of stale data from the previous run set.
+  // Reset during render when the run set changes, so stale data never flashes.
   const [prevRunsKey, setPrevRunsKey] = useState(runsKey);
   if (runsKey !== prevRunsKey) {
     setPrevRunsKey(runsKey);
@@ -92,85 +104,75 @@ export function useMetricsData(runs: RunColorEntry[]): UseMetricsDataResult {
     setError(null);
   }
 
-  // Discover tags whenever the checked-run set changes. Reset happens here
-  // (effect time), not in the render-time adjustment above, because mutating
-  // a ref during render isn't safe.
   useEffect(() => {
-    tagsByRunRef.current = {};
-    const currentRuns = runsRef.current;
-    if (currentRuns.length === 0) return;
+    if (!runsKey) return;
     let cancelled = false;
-    Promise.all(
-      currentRuns.map(async ({ run }): Promise<[string, string[]]> => [run, await fetchScalarTags(run)]),
-    )
-      .then((results) => {
-        if (cancelled) return;
-        const next: Record<string, string[]> = {};
-        for (const [run, discovered] of results) next[run] = discovered;
-        tagsByRunRef.current = next;
-        setTagsByRun(next);
-      })
-      .catch((e) => {
-        if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to discover scalar tags.');
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [runsKey]);
+    let inFlight = false;
 
-  // Poll every discovered (run, tag) pair together on one shared interval.
-  useEffect(() => {
-    const totalTagCount = Object.values(tagsByRun).reduce((n, tags) => n + tags.length, 0);
-    if (!runsKey || totalTagCount === 0) return;
-    let cancelled = false;
-
-    const poll = async () => {
+    const refresh = async () => {
+      if (inFlight) return;
+      inFlight = true;
       try {
-        const pairs: Array<[string, string]> = [];
-        for (const { run } of runsRef.current) {
-          for (const tag of tagsByRunRef.current[run] ?? []) pairs.push([run, tag]);
-        }
+        const allTags = await fetchAllScalarTags();
+        const nextTags: Record<string, string[]> = {};
+        for (const { run } of runsRef.current) nextTags[run] = allTags[run] ?? [];
+        const pairs = Object.entries(nextTags).flatMap(([run, tags]) => tags.map((tag) => [run, tag] as const));
         const results = await Promise.all(
-          pairs.map(
-            async ([run, tag]): Promise<[string, string, ScalarPoint[]]> => [run, tag, await fetchScalars(run, tag)],
-          ),
+          pairs.map(async ([run, tag]) => [run, tag, await fetchScalars(run, tag)] as const),
         );
         if (cancelled) return;
-        const next: Record<string, Record<string, ScalarPoint[]>> = {};
-        for (const [run, tag, points] of results) {
-          if (!next[run]) next[run] = {};
-          next[run][tag] = points;
-        }
-        setPointsByRunTag(next);
+        setTagsByRun((prev) => (sameTags(prev, nextTags) ? prev : nextTags));
+        setPointsByRunTag((prev) => {
+          let changed = Object.keys(prev).length !== Object.keys(nextTags).length;
+          const next: Record<string, Record<string, ScalarPoint[]>> = {};
+          for (const [run, tag, points] of results) {
+            const old = prev[run]?.[tag];
+            next[run] ??= {};
+            // Reuse unchanged arrays so charts don't re-render on idle polls.
+            if (samePoints(old, points)) next[run][tag] = old!;
+            else {
+              next[run][tag] = points;
+              changed = true;
+            }
+          }
+          for (const run of Object.keys(next)) {
+            if (Object.keys(next[run]).length !== Object.keys(prev[run] ?? {}).length) changed = true;
+          }
+          return changed ? next : prev;
+        });
         setError(null);
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load scalars.');
+      } finally {
+        inFlight = false;
       }
     };
 
-    void poll();
-    const interval = window.setInterval(poll, POLL_INTERVAL_MS);
+    void refresh();
+    const interval = window.setInterval(refresh, POLL_INTERVAL_MS);
     return () => {
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, [runsKey, tagsByRun]);
+  }, [runsKey, revision]);
 
   const seriesForTag = (tag: string): MetricSeries[] =>
     runs
       .filter(({ run }) => (tagsByRun[run] ?? []).includes(tag))
       .map(({ run, color }) => ({ run, color, points: pointsByRunTag[run]?.[tag] ?? [] }));
 
+  const legend = runs.filter(({ run }) => (tagsByRun[run] ?? []).length > 0);
+
   if (runs.length === 0) {
-    return { status: 'empty-runs', error: null, groups: [], seriesForTag };
+    return { status: 'empty-runs', error: null, groups: [], legend, seriesForTag };
   }
   if (error) {
-    return { status: 'error', error, groups: [], seriesForTag };
+    return { status: 'error', error, groups: [], legend, seriesForTag };
   }
 
   const allTagsKnown = runs.every(({ run }) => run in tagsByRun);
   if (!allTagsKnown) {
-    return { status: 'loading', error: null, groups: [], seriesForTag };
+    return { status: 'loading', error: null, groups: [], legend, seriesForTag };
   }
 
   // Union of every checked run's tags, in first-seen order (runs iterated in sorted order).
@@ -185,8 +187,8 @@ export function useMetricsData(runs: RunColorEntry[]): UseMetricsDataResult {
     }
   }
   if (allTags.length === 0) {
-    return { status: 'no-tags', error: null, groups: [], seriesForTag };
+    return { status: 'no-tags', error: null, groups: [], legend, seriesForTag };
   }
 
-  return { status: 'ready', error: null, groups: groupTags(allTags), seriesForTag };
+  return { status: 'ready', error: null, groups: groupTags(allTags), legend, seriesForTag };
 }

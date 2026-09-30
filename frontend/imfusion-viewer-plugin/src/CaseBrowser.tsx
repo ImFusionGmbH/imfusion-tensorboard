@@ -1,9 +1,9 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type RefCallback } from 'react';
 import { fetchCases, type CasesResponse } from './api';
 import { RUN_COLOR_PALETTE } from './runColors';
 
-// Case/step lists change only once per completed epoch, so this polls
-// slower than CaseViewer's own per-case poll.
+// Case/step lists change only once per completed epoch; fetchCases also
+// coalesces this with CaseViewer's own polls.
 const POLL_INTERVAL_MS = 3000;
 
 export interface Selection {
@@ -36,29 +36,17 @@ export interface CaseBrowserProps {
    */
   activeControlsRuns: Set<string>;
   /**
-   * Returns a stable ref callback for `run`'s panel container - a DOM node
-   * that run's CaseViewer portals its controls into (see App.tsx's
-   * `ViewerColumn`). Cached per run in App.tsx, not recreated each render:
-   * a fresh callback identity every render would make React tear down and
-   * re-register the node on every keystroke elsewhere in the sidebar.
+   * Returns a stable ref callback for `run`'s panel container, which that
+   * run's controls are re-parented into (see App.tsx's `ViewerColumn`).
+   * Must be cached per run: a fresh identity re-registers the node every render.
    */
-  registerControlsContainer: (run: string) => (el: HTMLDivElement | null) => void;
+  registerControlsContainer: (run: string) => RefCallback<HTMLDivElement>;
 }
 
-/**
- * Filters run names by `filterText` as a case-insensitive regex. An invalid
- * pattern (e.g. mid-typed) is treated as no filter, showing every run.
- */
-function filterRunNames(allRuns: string[], filterText: string): string[] {
+/** Compiles `filterText` as a case-insensitive regex; `null` means no filter. Throws on an invalid pattern. */
+function compileRunFilter(filterText: string): RegExp | null {
   const trimmed = filterText.trim();
-  if (!trimmed) return allRuns;
-  let re: RegExp;
-  try {
-    re = new RegExp(trimmed, 'i');
-  } catch {
-    return allRuns;
-  }
-  return allRuns.filter((run) => re.test(run));
+  return trimmed ? new RegExp(trimmed, 'i') : null;
 }
 
 export function CaseBrowser({
@@ -75,6 +63,9 @@ export function CaseBrowser({
   const [cases, setCases] = useState<CasesResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [filterText, setFilterText] = useState('');
+  // Last valid pattern: an invalid (e.g. mid-typed) regex keeps the previous filter.
+  const [runFilter, setRunFilter] = useState<RegExp | null>(null);
+  const [filterError, setFilterError] = useState<string | null>(null);
   const onCasesUpdateRef = useRef(onCasesUpdate);
   // Updated in an effect, not during render, matching the same pattern in CaseViewer.tsx.
   useEffect(() => {
@@ -92,6 +83,7 @@ export function CaseBrowser({
         setError(null);
         onCasesUpdateRef.current?.(result);
       } catch (e) {
+        // Keeps the last good list; the error shows inline until the next success.
         if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load cases.');
       }
     };
@@ -105,29 +97,49 @@ export function CaseBrowser({
   }, []);
 
   const allRunNames = useMemo(() => (cases ? Object.keys(cases).sort() : []), [cases]);
-  const visibleRunNames = useMemo(() => filterRunNames(allRunNames, filterText), [allRunNames, filterText]);
+  const visibleRunNames = useMemo(
+    () => (runFilter ? allRunNames.filter((run) => runFilter.test(run)) : allRunNames),
+    [allRunNames, runFilter],
+  );
 
-  if (error) return <div style={errorStyle}>{error}</div>;
-  if (!cases) return <div style={emptyStyle}>Loading cases…</div>;
+  if (!cases) return <div style={error ? errorStyle : emptyStyle}>{error ?? 'Loading cases…'}</div>;
 
   if (allRunNames.length === 0) {
     return <div style={emptyStyle}>No runs with imfusion_viewer data yet.</div>;
   }
 
+  const handleFilterChange = (text: string) => {
+    setFilterText(text);
+    try {
+      setRunFilter(compileRunFilter(text));
+      setFilterError(null);
+    } catch (e) {
+      setFilterError(e instanceof Error ? e.message : 'Invalid regex');
+    }
+  };
+
+  const visibleSet = new Set(visibleRunNames);
+
   return (
     <div style={wrapStyle}>
-      <input
-        type="text"
-        value={filterText}
-        onChange={(e) => setFilterText(e.target.value)}
-        placeholder="Write a regex to filter runs"
-        aria-label="Write a regex to filter runs"
-        style={filterInputStyle}
-      />
+      {error && <div style={errorStyle}>{error}</div>}
+      <div style={filterWrapStyle}>
+        <input
+          type="text"
+          value={filterText}
+          onChange={(e) => handleFilterChange(e.target.value)}
+          placeholder="Write a regex to filter runs"
+          aria-label="Write a regex to filter runs"
+          aria-invalid={filterError !== null}
+          style={filterError ? filterInputInvalidStyle : filterInputStyle}
+        />
+        {filterError && <div style={filterErrorStyle}>Invalid regex, showing the last valid filter.</div>}
+      </div>
 
       <div style={runListStyle}>
         {visibleRunNames.length === 0 && <div style={emptyStyle}>No runs match this filter.</div>}
-        {visibleRunNames.map((run, index) => {
+        {/* Filtered-out runs stay mounted (hidden) so their controls containers survive. */}
+        {allRunNames.map((run) => {
           const caseNames = Object.keys(cases[run]).sort();
           // For a single-case run, the checkbox alone both selects the case
           // and includes it in Metrics, collapsing what would otherwise be
@@ -139,7 +151,12 @@ export function CaseBrowser({
           const isChecked = checkedRuns.has(run);
 
           return (
-            <div key={run} style={index === 0 ? runGroupFirstStyle : runGroupStyle}>
+            <div
+              key={run}
+              style={
+                !visibleSet.has(run) ? hiddenStyle : run === visibleRunNames[0] ? runGroupFirstStyle : runGroupStyle
+              }
+            >
               <div style={runHeaderRowStyle}>
                 <input
                   type="checkbox"
@@ -200,26 +217,15 @@ export function CaseBrowser({
                 </div>
               )}
               {/*
-                Inline expanded panel: this run's own layer controls (view
-                toggles, scrubber, layer list) portal into this div - from
-                this run's own CaseViewer normally, or from the primary
-                run's CaseViewer when this run is an overlay in
-                combined-workspace mode (see App.tsx's
-                `overlayContainersForPrimary`), never merged into the
-                primary's own container either way. Rendered right under
-                this run's own row instead of in a separate detached
-                section, with a left border in the run's own identity color
-                tying it back to the checkbox/dot above. Always mounted
-                structurally alongside the row; only whether it's in the DOM
-                at all depends on `activeControlsRuns`, which is fine since
-                CaseViewer's own mount lifecycle is driven elsewhere
-                (App.tsx's `everCheckedRuns`), never by this.
+                This run's controls (from its own column, or from the primary's
+                in combined mode) land here. Always mounted, hidden while inactive,
+                so the container node stays stable.
               */}
-              {activeControlsRuns.has(run) && (
-                <div style={{ ...expandedPanelStyle, borderLeftColor: color }}>
-                  <div ref={registerControlsContainer(run)} />
-                </div>
-              )}
+              <div
+                style={activeControlsRuns.has(run) ? { ...expandedPanelStyle, borderLeftColor: color } : hiddenStyle}
+              >
+                <div ref={registerControlsContainer(run)} />
+              </div>
             </div>
           );
         })}
@@ -241,7 +247,12 @@ const wrapStyle: CSSProperties = {
   display: 'flex',
   flexDirection: 'column',
   gap: 10,
-  minHeight: 0,
+};
+
+const filterWrapStyle: CSSProperties = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 3,
 };
 
 // Uses theme tokens only, so it stays legible in both light and dark themes.
@@ -258,13 +269,23 @@ const filterInputStyle: CSSProperties = {
   color: 'inherit',
 };
 
+const filterInputInvalidStyle: CSSProperties = {
+  ...filterInputStyle,
+  border: '1px solid var(--tb-error)',
+};
+
+const filterErrorStyle: CSSProperties = {
+  fontSize: 12,
+  color: 'var(--tb-error)',
+};
+
 // No gap here: each run's own group supplies its spacing via
 // `runGroupStyle`'s top padding/border, since groups are no longer uniform
 // height (a checked run's inline expanded panel makes some much taller).
+// No own overflow: the sidebar is the single scroll container.
 const runListStyle: CSSProperties = {
   display: 'flex',
   flexDirection: 'column',
-  overflowY: 'auto',
 };
 
 // A top border separates consecutive runs now that a checked run's own
@@ -396,4 +417,8 @@ const emptyStyle: CSSProperties = {
 const errorStyle: CSSProperties = {
   padding: '8px 0',
   color: 'var(--tb-error)',
+};
+
+const hiddenStyle: CSSProperties = {
+  display: 'none',
 };

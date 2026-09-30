@@ -1,4 +1,15 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties, type RefObject } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type PointerEvent as ReactPointerEvent,
+  type RefCallback,
+  type RefObject,
+  type SyntheticEvent,
+} from 'react';
 import { createPortal } from 'react-dom';
 import {
   ImFusionCanvas,
@@ -13,13 +24,25 @@ import { AboutButton } from './AboutButton';
 import { CaseBrowser, type Selection } from './CaseBrowser';
 import { CaseViewer, type OverlayRun } from './CaseViewer';
 import { CollapsibleSection } from './CollapsibleSection';
+import { ContextMenu } from './ContextMenu';
 import { DockedMetrics } from './DockedMetrics';
 import { assignRunColors, RUN_COLOR_PALETTE } from './runColors';
 import { getThemeTokens, hexToVec3 } from './theme';
 import { useMetricsData } from './useMetricsData';
 import { useTensorBoardTheme } from './useTensorBoardTheme';
 import type { VolumeView } from '@imfusion/sdk';
-import { fetchLicenseToken, type CaseMeta, type CasesResponse } from './api';
+import { fetchLicenseToken, type CaseMeta, type CasesResponse, type LayerMeta } from './api';
+import {
+  forceRelayout,
+  isMenuActionRunning,
+  maximizedViewOf,
+  reassertHidden,
+  viewNameOf,
+  viewsForKind,
+  VIEWS,
+  watchDrawnViews,
+  type ViewName,
+} from './viewVisibility';
 
 // Adds an index signature for `--*` custom CSS properties, which
 // `CSSProperties` doesn't support natively. Only needed for the root
@@ -86,6 +109,19 @@ interface CameraPose {
 
 const cameraSyncSubscribers = new Set<(pose: CameraPose) => void>();
 
+// The column that last got pointer/wheel/menu input; only it broadcasts, so a
+// column's own centerOnData on load never yanks the others.
+let cameraDriver: object | null = null;
+const cameraDriverWakeups = new Map<object, () => void>();
+
+function claimCameraDriver(token: object): void {
+  cameraDriver = token;
+  cameraDriverWakeups.get(token)?.();
+}
+
+// How long the driver keeps sampling its camera after input, to catch SDK animations (e.g. menu Reset).
+const FOLLOW_MS = 1000;
+
 // Absorbs the drift from the SDK re-normalizing look/up vectors on setCamera,
 // which exact equality would turn into an endless echo between columns.
 const POSE_EPSILON = 1e-4;
@@ -118,25 +154,23 @@ function samePose(a: number[], b: number[]): boolean {
 
 /**
  * Mirrors this column's 3D camera onto every other column showing the same
- * case, so orbiting one run moves all of them. Renders nothing; must live
- * inside `<ImFusionReady>`.
+ * case. Renders nothing; must live inside `<ImFusionReady>`.
  *
- * The SDK has no camera-changed signal, so the camera is read on the display's
- * render requests. Only the hovered column broadcasts: pointer capture keeps
- * `:hover` on the canvas through a drag, and gating on it is what stops a
- * column's own `centerOnData` from yanking every other column when a case loads.
+ * The SDK has no camera-changed signal, so once this column is the driver
+ * (see `claimCameraDriver`) its pose is sampled every frame for `FOLLOW_MS`
+ * after each input or update request.
  */
-function CameraSync({ caseName, linked }: { caseName: string | null; linked: boolean }) {
+function CameraSync({ caseName, linked, token }: { caseName: string | null; linked: boolean; token: object }) {
   const imf = useImFusion();
 
   useEffect(() => {
     // Unlinking unsubscribes entirely, so a column keeps whatever view it had.
-    // Re-linking re-reads `lastPose` below, so it never jumps to a stale one.
     if (caseName === null || !linked) return;
     const view = imf.display.main3dView();
-    // The last pose this column sent or applied, and the whole echo guard: a
-    // pose we just applied reads back unchanged, so nothing bounces.
+    // Last pose sent or applied; also the echo guard.
     let lastPose = readPose(view);
+    let followUntil = 0;
+    let rafId: number | null = null;
 
     const receive = (pose: CameraPose) => {
       // World-space poses are meaningless across different anatomy.
@@ -146,24 +180,206 @@ function CameraSync({ caseName, linked }: { caseName: string | null; linked: boo
     };
     cameraSyncSubscribers.add(receive);
 
-    const unsubscribe = imf.display.onUpdateRequested(() => {
-      // ponytail: hover is the whole "who is driving" heuristic, and it's dead
-      // on touch (the SDK's touch path sets no pointer capture). Swap in an
-      // explicit pointerdown latch if tablets ever need to drive the sync.
-      if (!imf.canvas.matches(':hover')) return;
+    const tick = () => {
+      rafId = null;
+      if (cameraDriver !== token) return;
       const pose = readPose(view);
-      if (samePose(pose, lastPose)) return;
-      lastPose = pose;
-      for (const subscriber of cameraSyncSubscribers) {
-        if (subscriber !== receive) subscriber({ case: caseName, values: pose });
+      if (!samePose(pose, lastPose)) {
+        lastPose = pose;
+        for (const subscriber of cameraSyncSubscribers) {
+          if (subscriber !== receive) subscriber({ case: caseName, values: pose });
+        }
       }
+      if (performance.now() < followUntil) rafId = requestAnimationFrame(tick);
+    };
+    const wake = () => {
+      followUntil = performance.now() + FOLLOW_MS;
+      rafId ??= requestAnimationFrame(tick);
+    };
+    cameraDriverWakeups.set(token, wake);
+
+    const unsubscribe = imf.display.onUpdateRequested(() => {
+      if (cameraDriver === token && performance.now() < followUntil) wake();
     });
 
     return () => {
       cameraSyncSubscribers.delete(receive);
+      if (cameraDriverWakeups.get(token) === wake) cameraDriverWakeups.delete(token);
       unsubscribe();
+      if (rafId !== null) cancelAnimationFrame(rafId);
     };
-  }, [imf, caseName, linked]);
+  }, [imf, caseName, linked, token]);
+
+  return null;
+}
+
+/**
+ * Stops a hidden (display:none) column from resizing to 0x0 and rendering;
+ * resumes, re-measures and re-renders once shown. Layout effect so it runs
+ * before the ResizeObserver sees the new size.
+ */
+function PauseWhenHidden({ visible }: { visible: boolean }) {
+  const imf = useImFusion();
+
+  useLayoutEffect(() => {
+    if (visible) return;
+    imf.pauseAutoResize();
+    imf.pauseAutoRender();
+    return () => {
+      imf.resumeAutoResize();
+      imf.resumeAutoRender();
+      imf.render();
+    };
+  }, [imf, visible]);
+
+  return null;
+}
+
+interface ViewVisibilitySyncProps {
+  hiddenViews: ReadonlySet<ViewName>;
+  /** Panes this column has data for; re-checking a pane never force-opens an empty one. */
+  viewsWithData: ReadonlySet<ViewName>;
+  /** Bumped by sidebar toggles and "Restore layout": un-maximizes before applying. */
+  restoreToken: number;
+  onMenuHide: (name: ViewName) => void;
+  /** The pane this column shows maximized (detected from what renders), or `null`. */
+  onMaximizedChange: (name: ViewName | null) => void;
+}
+
+/**
+ * Applies the app-wide hidden-pane set to this column. Only ever re-hides
+ * user-hidden panes; un-hides only on an explicit re-check, so panes the SDK
+ * auto-hid for incompatible data stay hidden. Must live inside `<ImFusionReady>`.
+ */
+function ViewVisibilitySync({
+  hiddenViews,
+  viewsWithData,
+  restoreToken,
+  onMenuHide,
+  onMaximizedChange,
+}: ViewVisibilitySyncProps) {
+  const imf = useImFusion();
+  const hiddenRef = useRef(hiddenViews);
+  const viewsWithDataRef = useRef(viewsWithData);
+  const onMenuHideRef = useRef(onMenuHide);
+  const onMaximizedChangeRef = useRef(onMaximizedChange);
+  const prevRef = useRef<ReadonlySet<ViewName> | null>(null);
+  const restoreRef = useRef(restoreToken);
+  // Our own setViewHidden calls, which the signal handler must ignore.
+  const applyingRef = useRef(false);
+
+  useLayoutEffect(() => {
+    viewsWithDataRef.current = viewsWithData;
+    onMenuHideRef.current = onMenuHide;
+    onMaximizedChangeRef.current = onMaximizedChange;
+  });
+
+  useLayoutEffect(() => {
+    const display = imf.display;
+    const layouter = display.layouter();
+    const prev = prevRef.current;
+    prevRef.current = hiddenViews;
+    hiddenRef.current = hiddenViews;
+    applyingRef.current = true;
+    try {
+      if (restoreRef.current !== restoreToken) {
+        restoreRef.current = restoreToken;
+        layouter.setMaximizedView(null);
+        forceRelayout(display, hiddenViews);
+      }
+      for (const spec of VIEWS) {
+        const view = spec.get(display);
+        if (hiddenViews.has(spec.name)) {
+          if (!layouter.isViewHidden(view)) layouter.setViewHidden(view, true);
+        } else if (prev?.has(spec.name) && viewsWithDataRef.current.has(spec.name) && layouter.isViewHidden(view)) {
+          layouter.setViewHidden(view, false);
+        }
+      }
+    } catch (e) {
+      console.warn('imfusion_viewer: could not apply hidden views', e);
+    } finally {
+      applyingRef.current = false;
+    }
+  }, [imf, hiddenViews, restoreToken]);
+
+  useEffect(() => {
+    const display = imf.display;
+    const layouter = display.layouter();
+    let disposed = false;
+    let queued = false;
+
+    const withApplying = (fn: () => void) => {
+      applyingRef.current = true;
+      try {
+        fn();
+      } catch (e) {
+        console.warn('imfusion_viewer: could not apply hidden views', e);
+      } finally {
+        applyingRef.current = false;
+      }
+    };
+    // Deferred: re-entering the layouter from inside its own signal is unsafe.
+    const reassertSoon = () => {
+      if (queued) return;
+      queued = true;
+      queueMicrotask(() => {
+        queued = false;
+        if (!disposed) withApplying(() => reassertHidden(display, hiddenRef.current));
+      });
+    };
+    const relayout = () => withApplying(() => forceRelayout(display, hiddenRef.current));
+
+    const offs: (() => void)[] = [];
+    offs.push(
+      layouter.onViewHiddenChanged((view, hidden) => {
+        if (applyingRef.current) return;
+        const name = viewNameOf(display, view);
+        if (!name) return;
+        if (!hidden) {
+          // The SDK re-shows panes on data changes; keep the user's hides.
+          if (hiddenRef.current.has(name)) reassertSoon();
+        } else if (isMenuActionRunning() && !hiddenRef.current.has(name)) {
+          // Menu "Hide View" (possibly on a maximized pane): record it and show the rest.
+          queueMicrotask(() => {
+            if (disposed) return;
+            withApplying(() => {
+              layouter.setMaximizedView(null);
+              forceRelayout(display, new Set(hiddenRef.current).add(name));
+            });
+            onMenuHideRef.current(name);
+          });
+        }
+      }),
+    );
+    if (typeof layouter.onModeChanged === 'function') offs.push(layouter.onModeChanged(reassertSoon));
+
+    // Maximize state comes from which pane drew over the whole canvas. Re-laying out only when a user-hidden pane drew
+    // (the ⤢ restore can bring back a stale layout), not on every click: that would reorder panes
+    // under an open ⇄ menu and make its swap/move actions hit the wrong pane.
+    let lastMaximized: ViewName | null = null;
+    let lastLeak: string | null = null;
+    offs.push(
+      watchDrawnViews(imf, (drawn) => {
+        const expected = new Set(VIEWS.map((s) => s.name).filter((n) => !hiddenRef.current.has(n) && viewsWithDataRef.current.has(n)));
+        const maximized = maximizedViewOf(drawn, expected, imf.canvas);
+        if (maximized !== lastMaximized) {
+          lastMaximized = maximized;
+          onMaximizedChangeRef.current(maximized);
+        }
+        const leaked = maximized === null && [...drawn.keys()].some((n) => hiddenRef.current.has(n));
+        const sig = leaked ? [...drawn.keys()].sort().join(',') : null;
+        // Once per distinct layout, so a pane the SDK insists on can't loop re-layouts.
+        if (sig !== null && sig !== lastLeak) relayout();
+        lastLeak = sig;
+      }),
+    );
+
+    return () => {
+      disposed = true;
+      for (const off of offs) off();
+      if (lastMaximized) onMaximizedChangeRef.current(null);
+    };
+  }, [imf]);
 
   return null;
 }
@@ -191,7 +407,8 @@ function exportCanvasAsPng(imf: ReturnType<typeof useImFusion>, canvas: HTMLCanv
       document.body.appendChild(a);
       a.click();
       a.remove();
-      URL.revokeObjectURL(url);
+      // Deferred: revoking in the same tick can abort the download in Firefox/Safari.
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
     }, 'image/png');
   });
 }
@@ -225,94 +442,114 @@ function ExportButton({ canvasRef, run, caseName, step }: ExportButtonProps) {
   );
 }
 
-export interface ViewerColumnProps {
-  /** The run this column is permanently assigned to (see `everCheckedRuns` in `App`). */
-  run: string;
-  /** This run's stable identity color (see runColors.ts), shown in the column's header label and on its 3D view border. */
-  color: string;
+/** Props every column gets identically from `App`; add app-wide column state (e.g. hidden views) here. */
+export interface SharedColumnProps {
   /** TensorBoard's live dark-mode flag, forwarded to `CanvasChrome`. */
   isDark: boolean;
-  /**
-   * WebSDK license token, or `null` if the server has none configured.
-   * Must be settled before this column first renders (see `App`).
-   */
+  /** WebSDK license token, or `null` if none. Must be settled before a column first renders (see `App`). */
   licenseToken: string | null;
   /** Whether this column's 3D camera follows the other columns'. */
   linkCameras: boolean;
-  selection: Selection | null;
-  caseMeta: CaseMeta | undefined;
-  /**
-   * Other checked runs' layers to load into this column's own WASM instance
-   * alongside its own, so they render together in one shared workspace
-   * (combined-workspace mode). Empty outside that mode.
-   */
-  overlayRuns: OverlayRun[];
-  /**
-   * Reports this column's scrubbed epoch upward. Only wired up for the
-   * primary (first-checked) column, to drive the shared metrics chart's
-   * current-step marker.
-   */
-  onCurrentStepChange?: (step: number | null) => void;
-  /**
-   * DOM node, rendered inline under this run's own row in the sidebar's
-   * Runs list (see `CaseBrowser`), that this column's controls (view
-   * toggles, scrubber, layer list, export button) portal into - or `null`
-   * while that row hasn't mounted yet (see `App`'s
-   * `registerControlsContainer`). Rendering the controls next to the canvas
-   * they affect made it impossible to see a layer while adjusting its own
-   * opacity/color, since the panel had to sit on top of the canvas to be
-   * reachable at all; a portal keeps CaseViewer mounted in this column's own
-   * provider tree (so its WASM-backed state is unaffected) while its output
-   * DOM lives in the sidebar instead.
-   */
-  controlsContainer: HTMLElement | null;
-  /**
-   * Per-overlay-run sidebar containers (see `App`'s
-   * `overlayContainersForPrimary`): each overlay run's own layer controls
-   * portal into its OWN row's container here, not into this column's
-   * `controlsContainer`, so combining runs on the canvas never combines
-   * their entries in the sidebar. Only set on the primary column.
-   */
-  overlayControlsContainers?: Map<string, HTMLElement | null>;
-  /**
-   * DOM node the shared view-toggle row portals into instead of rendering
-   * inline (see `App`'s "Viewer Control" section/`registerViewToggleContainer`).
-   * Always set on the primary column, regardless of combined/side-by-side
-   * mode; `null`/undefined on every other column, which keeps its own inline
-   * toggle row.
-   */
-  viewToggleContainer?: HTMLElement | null;
+  /** Panes the user hid (sidebar or menu "Hide View"), applied to every column. */
+  hiddenViews: ReadonlySet<ViewName>;
+  /** See `ViewVisibilitySync`. */
+  layoutRestoreToken: number;
+  onMenuHideView: (name: ViewName) => void;
+  onMaximizedChange: (run: string, name: ViewName | null) => void;
 }
 
-/**
- * One self-contained ImFusion provider/canvas/CaseViewer stack for one run.
- * `App` mounts this lazily on first check and never unmounts it again, so
- * each ever-checked run keeps its own WASM instance and CaseViewer state.
- */
+export interface ViewerColumnProps extends SharedColumnProps {
+  run: string;
+  /** This run's identity color (see runColors.ts), for the header dot and 3D view border. */
+  color: string;
+  /** Whether the column is on screen; hidden columns pause rendering/resizing. */
+  visible: boolean;
+  selection: Selection | null;
+  caseMeta: CaseMeta | undefined;
+  /** Other checked runs' layers loaded into this column's WASM instance (combined mode); empty otherwise. */
+  overlayRuns: OverlayRun[];
+  /** Reports the scrubbed epoch upward; only set on the primary column (drives the metrics step marker). */
+  onCurrentStepChange?: (step: number | null) => void;
+  /**
+   * This run's sidebar row container (see `CaseBrowser`), or `null` while
+   * there is none or the column is hidden. The controls are rendered into a
+   * node the column owns and only re-parented here, so this never remounts CaseViewer.
+   */
+  controlsContainer: HTMLElement | null;
+  /** Overlay run -> its own sidebar container, so combined runs keep separate sidebar entries. Primary only. */
+  overlayControlsContainers?: Map<string, HTMLElement | null>;
+}
+
+function viewsWithDataOf(layerLists: Array<LayerMeta[] | undefined>): Set<ViewName> {
+  const views = new Set<ViewName>();
+  for (const layers of layerLists) {
+    for (const meta of layers ?? []) for (const name of viewsForKind(meta.kind)) views.add(name);
+  }
+  return views;
+}
+
+/** One ImFusion provider/canvas/CaseViewer stack for one run. */
 function ViewerColumn({
   run,
   color,
+  visible,
   isDark,
   licenseToken,
   linkCameras,
+  hiddenViews,
+  layoutRestoreToken,
+  onMenuHideView,
+  onMaximizedChange,
   selection,
   caseMeta,
   overlayRuns,
   onCurrentStepChange,
   controlsContainer,
   overlayControlsContainers,
-  viewToggleContainer,
 }: ViewerColumnProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  // Forces CaseViewer to remount (and so fully reload) whenever the set of
-  // overlaid runs changes, rather than trying to add/remove WASM-loaded
-  // sources in place - the same "remount on identity change" approach
-  // already used for case switches below.
+  // Remounts CaseViewer when the overlaid run set changes, like a case switch.
   const overlayKey = overlayRuns.map((o) => o.run).sort().join(',');
+  const viewsWithData = viewsWithDataOf([caseMeta?.layers, ...overlayRuns.map((o) => o.initialLayers)]);
   const [currentStep, setCurrentStep] = useState<number | null>(null);
+  // Bumped to rebuild the provider (new canvas, GL context and WASM instance) after a lost context.
+  const [generation, setGeneration] = useState(0);
+  const [contextLost, setContextLost] = useState(false);
+  const [syncToken] = useState(() => ({}));
+  // Stable portal target owned by this column. Changing a portal's container
+  // remounts its children, so the node is re-parented instead.
+  const [controlsNode] = useState(() => document.createElement('div'));
 
-  // Tracks the scrubbed epoch locally (used in ExportButton's filename) and
-  // forwards it to the optional parent callback.
+  useLayoutEffect(() => {
+    if (!controlsContainer) return;
+    controlsContainer.appendChild(controlsNode);
+    return () => controlsNode.remove();
+  }, [controlsContainer, controlsNode]);
+
+  const reloadProvider = useCallback(() => {
+    setContextLost(false);
+    setGeneration((g) => g + 1);
+  }, []);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const onLost = (e: Event) => {
+      e.preventDefault(); // allows a later 'webglcontextrestored'
+      setContextLost(true);
+    };
+    canvas.addEventListener('webglcontextlost', onLost);
+    canvas.addEventListener('webglcontextrestored', reloadProvider);
+    return () => {
+      canvas.removeEventListener('webglcontextlost', onLost);
+      canvas.removeEventListener('webglcontextrestored', reloadProvider);
+      // Free a removed canvas's context now, not at GC, so it stops counting toward the browser's cap.
+      setTimeout(() => {
+        if (!canvas.isConnected) canvas.getContext('webgl2')?.getExtension('WEBGL_lose_context')?.loseContext();
+      }, 0);
+    };
+  }, [generation, reloadProvider]);
+
   const handleCurrentStepChange = useCallback(
     (step: number | null) => {
       setCurrentStep(step);
@@ -321,27 +558,47 @@ function ViewerColumn({
     [onCurrentStepChange],
   );
 
-  return (
-    <ImFusionProvider options={{ autoResize: true, uiAnimations: false, licenseToken: licenseToken ?? undefined }}>
-      <div style={columnInnerWrapStyle}>
-        {/* Header labeling which run this column shows. */}
-        <div style={columnHeaderStyle}>
-          <div style={columnHeaderLabelGroupStyle}>
-            <span style={{ ...columnHeaderDotStyle, background: color }} />
-            <span style={columnHeaderNameStyle} title={run}>
-              {run}
-            </span>
-          </div>
-        </div>
+  // Input on this canvas or its context menu makes this column the camera-sync driver.
+  const claimCamera = useCallback(
+    (e: SyntheticEvent) => {
+      const target = e.target;
+      if (target === canvasRef.current || (target instanceof Element && target.closest('[data-imf-context-menu]'))) {
+        claimCameraDriver(syncToken);
+      }
+    },
+    [syncToken],
+  );
+  const handleMaximizedChange = useCallback((name: ViewName | null) => onMaximizedChange(run, name), [onMaximizedChange, run]);
+  const claimCameraWhileDragging = useCallback(
+    (e: ReactPointerEvent) => {
+      if (e.buttons !== 0) claimCamera(e);
+    },
+    [claimCamera],
+  );
 
-        {/*
-          `autoResize` keeps the canvas sized correctly as columns reflow in
-          the grid. `uiAnimations` is disabled since epoch scrubbing
-          triggered distracting animations. No overlay panel here anymore:
-          the layer/opacity/color controls render in the sidebar instead
-          (via the portal below), so nothing ever sits on top of the canvas.
-        */}
-        <div style={canvasContainerStyle}>
+  return (
+    <div style={columnInnerWrapStyle}>
+      <div style={columnHeaderStyle}>
+        <div style={columnHeaderLabelGroupStyle}>
+          <span style={{ ...columnHeaderDotStyle, background: color }} />
+          <span style={columnHeaderNameStyle} title={run}>
+            {run}
+          </span>
+        </div>
+      </div>
+
+      {/* `uiAnimations` off: epoch scrubbing triggered distracting animations. */}
+      <ImFusionProvider
+        key={generation}
+        options={{ autoResize: true, uiAnimations: false, licenseToken: licenseToken ?? undefined }}
+      >
+        <div
+          style={canvasContainerStyle}
+          onPointerDownCapture={claimCamera}
+          onPointerMoveCapture={claimCameraWhileDragging}
+          onWheelCapture={claimCamera}
+          onContextMenuCapture={claimCamera}
+        >
           <ImFusionCanvas ref={canvasRef} style={canvasStyle} />
           <ImFusionLoading>
             <div style={centerMsgStyle}>Initializing ImFusion WebSDK…</div>
@@ -351,148 +608,152 @@ function ViewerColumn({
           </ImFusionError>
           <ImFusionReady>
             <CanvasChrome isDark={isDark} color={color} />
-            <CameraSync caseName={selection?.case ?? null} linked={linkCameras} />
-            {!(selection && caseMeta) && (
-              <div style={centerMsgStyle}>Select a case from the list to begin.</div>
-            )}
-            {/*
-              Always mounted: never conditionally render CaseViewer based on
-              whether `controlsContainer` is set. Unmounting it runs its WASM
-              cleanup effect, which would wipe loaded data and reset the
-              scrub/layer state (this exact bug has recurred more than
-              once). `createPortal` only relocates the *rendered DOM*, not
-              the component itself, so it's safe to gate on `controlsContainer`
-              here - CaseViewer still mounts based on `selection`/`caseMeta`
-              alone, exactly as before.
-            */}
-            {controlsContainer &&
-              createPortal(
-                selection && caseMeta ? (
-                  <>
-                    <CaseViewer
-                      key={`${selection.run} ${selection.case} ${overlayKey}`}
+            <PauseWhenHidden visible={visible} />
+            <ViewVisibilitySync
+              hiddenViews={hiddenViews}
+              viewsWithData={viewsWithData}
+              restoreToken={layoutRestoreToken}
+              onMenuHide={onMenuHideView}
+              onMaximizedChange={handleMaximizedChange}
+            />
+            <CameraSync caseName={selection?.case ?? null} linked={linkCameras} token={syncToken} />
+            <ContextMenu />
+            {!(selection && caseMeta) && <div style={centerMsgStyle}>Select a case from the list to begin.</div>}
+            {/* Always mounted while a case is selected; only the portal node moves in and out of the sidebar. */}
+            {createPortal(
+              selection && caseMeta ? (
+                <>
+                  <CaseViewer
+                    key={`${selection.run} ${selection.case} ${overlayKey}`}
+                    run={selection.run}
+                    caseName={selection.case}
+                    initialLayers={caseMeta.layers}
+                    initialSteps={caseMeta.steps}
+                    overlayRuns={overlayRuns}
+                    overlayContainers={overlayControlsContainers}
+                    hiddenViews={hiddenViews}
+                    onCurrentStepChange={handleCurrentStepChange}
+                  />
+                  <div style={exportRowStyle}>
+                    <ExportButton
+                      canvasRef={canvasRef}
                       run={selection.run}
                       caseName={selection.case}
-                      initialLayers={caseMeta.layers}
-                      initialSteps={caseMeta.steps}
-                      overlayRuns={overlayRuns}
-                      overlayContainers={overlayControlsContainers}
-                      viewToggleContainer={viewToggleContainer}
-                      onCurrentStepChange={handleCurrentStepChange}
+                      step={currentStep}
                     />
-                    <div style={exportRowStyle}>
-                      <ExportButton
-                        canvasRef={canvasRef}
-                        run={selection.run}
-                        caseName={selection.case}
-                        step={currentStep}
-                      />
-                    </div>
-                  </>
-                ) : (
-                  <div style={panelEmptyStyle}>No case selected.</div>
-                ),
-                controlsContainer,
-              )}
+                  </div>
+                </>
+              ) : (
+                <div style={panelEmptyStyle}>No case selected.</div>
+              ),
+              controlsNode,
+            )}
           </ImFusionReady>
+          {contextLost && (
+            <div style={contextLostStyle}>
+              <span>The WebGL context was lost.</span>
+              <button type="button" onClick={reloadProvider} style={reloadButtonStyle}>
+                Reload
+              </button>
+            </div>
+          )}
         </div>
-      </div>
-    </ImFusionProvider>
+      </ImFusionProvider>
+    </div>
   );
 }
 
+// Hidden columns beyond this many (least recently shown first) are unmounted,
+// freeing their WASM heap and WebGL context. Shown columns never are.
+const MAX_LIVE_COLUMNS = 4;
+
 export function App() {
-  // Detected once here and passed down to every component via CSS variables
-  // on the root div. TensorBoard core's dark-mode state doesn't automatically
-  // apply inside this plugin's iframe, so it must be re-detected independently.
+  // TensorBoard core's dark mode doesn't reach this iframe, so it's re-detected
+  // here and handed down as CSS variables on the root div.
   const isDark = useTensorBoardTheme();
   const themeTokens = getThemeTokens(isDark);
 
-  // run name -> the case currently selected for viewing within that run.
-  // Entries are never removed on uncheck, only added or overwritten, so
-  // re-checking a run redisplays whatever it last had selected.
+  // run name -> the case selected within that run. Only added/overwritten,
+  // so re-checking a run redisplays whatever it last had selected.
   const [selectedCaseByRun, setSelectedCaseByRun] = useState<Map<string, string>>(new Map());
   const [cases, setCases] = useState<CasesResponse | null>(null);
-  // Which runs are checked for the Metrics comparison and for showing their
-  // viewer column. Kept independent of `selectedCaseByRun`: unchecking a run
-  // never forgets which case it had selected.
+  // Runs checked for Metrics and for showing their viewer column.
   const [checkedRuns, setCheckedRuns] = useState<Set<string>>(new Set());
 
-  // Every run name that has ever been checked, in first-checked order and
-  // never shrinking. Determines which runs get a permanently-mounted
-  // ViewerColumn; unchecking a run only hides its column via CSS, it's never
-  // unmounted (see `columns`/`columnVisibleStyle` below).
+  // Every run ever checked, in first-checked order; fixes column order and
+  // which checked run is primary.
   const [everCheckedRuns, setEverCheckedRuns] = useState<string[]>([]);
+  // Most recently shown first; decides which hidden columns stay mounted.
+  const [recentRuns, setRecentRuns] = useState<string[]>([]);
 
-  // The primary (first-checked) column's scrubbed epoch, used to draw the
-  // matching dashed step marker on the sidebar's shared DockedMetrics charts.
+  // The primary column's scrubbed epoch, for the metrics charts' step marker.
   const [primaryCurrentStep, setPrimaryCurrentStep] = useState<number | null>(null);
 
-  // `undefined` until the fetch settles, then the token or `null`. No column
-  // may render before then: ImFusionProvider captures its options on first
-  // render, so a token arriving afterwards would never reach the SDK and the
-  // viewer would keep the unlicensed watermark for the rest of the session.
+  // `undefined` until the fetch settles. ImFusionProvider reads its options
+  // once, so no column may render before the token is known.
   const [licenseToken, setLicenseToken] = useState<string | null | undefined>(undefined);
 
-  // On by default: comparing the same case across runs from a common viewpoint
-  // is the reason several columns are open at once. The control stays rendered
-  // (just disabled) with fewer than two visible columns, so the setting is
-  // never in effect while invisible.
+  // On by default: comparing the same case across runs from one viewpoint is
+  // why several columns are open at once.
   const [linkCameras, setLinkCameras] = useState(true);
 
-  // Off by default: overlaying every checked run's layers into one shared
-  // workspace is a more specialized comparison than the default side-by-side
-  // columns. Collapses every non-primary column into the primary one's WASM
-  // instance (see `overlayRunsForPrimary` below) instead of giving each its
-  // own; the other columns stay mounted (never unmounted, per the invariant
-  // above) but hidden, so re-disabling this is instant.
+  // Folds every checked run's layers into the primary column's WASM instance
+  // (see `overlayRunsForPrimary`); the other columns are hidden meanwhile.
   const [combinedWorkspace, setCombinedWorkspace] = useState(false);
 
-  // DOM nodes rendered inline under each run's own row in the sidebar's Runs
-  // list (see CaseBrowser.tsx), one per column currently shown there (see
-  // `showAsColumn` below), that each column's CaseViewer portals its
-  // controls into. A plain ref (not state) holds the nodes themselves - only
-  // the version counter is state, just to force a re-render once a *new*
-  // node appears, since a ref write alone wouldn't.
-  const controlsContainersRef = useRef<Map<string, HTMLDivElement>>(new Map());
-  const [, setControlsContainerVersion] = useState(0);
-  // Cached per run, not recreated every render: a `ref` callback whose
-  // identity changes between renders makes React call the old one with
-  // `null` and the new one with the element on every single commit, even
-  // when the DOM node itself hasn't changed. That previously deleted and
-  // re-added this run's map entry every render, each re-add bumping the
-  // version state and triggering another render - an infinite loop (React
-  // error #185, "Maximum update depth exceeded").
-  const registerControlsContainerFnsRef = useRef<Map<string, (el: HTMLDivElement | null) => void>>(new Map());
+  // run -> its sidebar controls container (see CaseBrowser). State, not a ref,
+  // so a new container re-renders the columns that use it.
+  const [controlsContainers, setControlsContainers] = useState<ReadonlyMap<string, HTMLElement>>(() => new Map());
+  // Ref callbacks cached per run: a new identity each render would make React
+  // detach/re-attach every container on every commit.
+  const registerControlsContainerFnsRef = useRef<Map<string, RefCallback<HTMLDivElement>>>(new Map());
   const registerControlsContainer = useCallback((run: string) => {
     let fn = registerControlsContainerFnsRef.current.get(run);
     if (!fn) {
       fn = (el: HTMLDivElement | null) => {
-        if (el) {
-          if (controlsContainersRef.current.get(run) !== el) {
-            controlsContainersRef.current.set(run, el);
-            setControlsContainerVersion((v) => v + 1);
-          }
-        } else {
-          controlsContainersRef.current.delete(run);
-        }
+        if (!el) return;
+        setControlsContainers((prev) => (prev.get(run) === el ? prev : new Map(prev).set(run, el)));
+        return () =>
+          setControlsContainers((prev) => {
+            if (prev.get(run) !== el) return prev;
+            const next = new Map(prev);
+            next.delete(run);
+            return next;
+          });
       };
       registerControlsContainerFnsRef.current.set(run, fn);
     }
     return fn;
   }, []);
 
-  // Single shared DOM node (not per-run, unlike `controlsContainersRef`
-  // above): only the primary column's view-toggle row ever needs a home
-  // here (see render site below, the always-visible "Viewer Control"
-  // section) - every other column keeps its own inline copy.
-  const viewToggleContainerRef = useRef<HTMLDivElement | null>(null);
-  const [, setViewToggleContainerVersion] = useState(0);
-  const registerViewToggleContainer = useCallback((el: HTMLDivElement | null) => {
-    if (viewToggleContainerRef.current !== el) {
-      viewToggleContainerRef.current = el;
-      setViewToggleContainerVersion((v) => v + 1);
-    }
+  // Panes the user hid, shared by every column; survives case switches and Combine.
+  const [hiddenViews, setHiddenViews] = useState<ReadonlySet<ViewName>>(() => new Set());
+  const [layoutRestoreToken, setLayoutRestoreToken] = useState(0);
+
+  const handleToggleView = useCallback((name: ViewName, show: boolean) => {
+    setHiddenViews((prev) => {
+      const next = new Set(prev);
+      if (show) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+    setLayoutRestoreToken((n) => n + 1);
+  }, []);
+
+  const handleMenuHideView = useCallback((name: ViewName) => {
+    setHiddenViews((prev) => (prev.has(name) ? prev : new Set(prev).add(name)));
+  }, []);
+
+  // run -> the pane its column shows maximized (read from what renders; the SDK has no getter).
+  const [maximizedByRun, setMaximizedByRun] = useState<ReadonlyMap<string, ViewName>>(() => new Map());
+  const handleMaximizedChange = useCallback((run: string, name: ViewName | null) => {
+    setMaximizedByRun((prev) => {
+      if ((prev.get(run) ?? null) === name) return prev;
+      const next = new Map(prev);
+      if (name) next.set(run, name);
+      else next.delete(run);
+      return next;
+    });
   }, []);
 
   useEffect(() => {
@@ -509,9 +770,7 @@ export function App() {
       next.set(sel.run, sel.case);
       return next;
     });
-    // Viewing a case also checks its run for metrics comparison, so the
-    // common single-run case needs no extra click. Only ever adds, never
-    // removes, so unchecking other runs is preserved across case switches.
+    // Viewing a case also checks its run; never unchecks others.
     setCheckedRuns((prev) => (prev.has(sel.run) ? prev : new Set(prev).add(sel.run)));
   }, []);
 
@@ -524,10 +783,7 @@ export function App() {
     });
   }, []);
 
-  // "Toggle All Runs": checks every currently visible run if not all are
-  // already checked, otherwise unchecks all of them. Only touches
-  // `checkedRuns` directly; the render-time effect below handles mounting
-  // columns for any newly-checked run.
+  // Checks every visible run unless all already are, then unchecks them all.
   const handleToggleAllRuns = useCallback((visibleRuns: string[]) => {
     setCheckedRuns((prev) => {
       const allChecked = visibleRuns.length > 0 && visibleRuns.every((run) => prev.has(run));
@@ -540,24 +796,29 @@ export function App() {
     });
   }, []);
 
-  // Recomputed every render rather than memoized (cheap for this plugin's
-  // small run counts). Computed once here and shared with CaseBrowser and
-  // DockedMetrics so both agree on the same run-color mapping.
+  // Shared by CaseBrowser and DockedMetrics so both agree on run colors.
   const runColors = assignRunColors(cases ? Object.keys(cases) : []);
   const allRunNames = cases ? Object.keys(cases).sort() : [];
   const runsForMetrics = allRunNames
     .filter((run) => checkedRuns.has(run))
     .map((run) => ({ run, color: runColors.get(run) ?? RUN_COLOR_PALETTE[0] }));
 
-  // Called once here and shared with the single DockedMetrics instance in
-  // the sidebar. Calling this hook per-column would multiply network
-  // requests by the number of columns.
-  const metricsData = useMetricsData(runsForMetrics);
+  // Changes when a checked run logs a new step, so metrics refresh right away
+  // instead of waiting for their slow poll.
+  const metricsRevision = runsForMetrics
+    .map(({ run }) => {
+      const caseMetas = Object.values(cases?.[run] ?? {});
+      const latest = caseMetas.reduce((n, c) => Math.max(n, c.steps[c.steps.length - 1] ?? -1), -1);
+      return `${run}:${latest}`;
+    })
+    .join(',');
 
-  // Intentional setState-during-render (not useEffect), so a newly-checked
-  // run gets its column and, if it has exactly one case, that case
-  // auto-selected, in the same render pass. Always converges after at most
-  // one extra render, since `everCheckedRuns` only grows to match `checkedRuns`.
+  // One shared instance; per-column calls would multiply the requests.
+  const metricsData = useMetricsData(runsForMetrics, metricsRevision);
+
+  // Intentional setState-during-render, so a newly checked run gets its
+  // column (and its only case auto-selected) in the same pass. Converges,
+  // since `everCheckedRuns` only grows to match `checkedRuns`.
   const newlyCheckedRuns = [...checkedRuns].filter((run) => !everCheckedRuns.includes(run));
   if (newlyCheckedRuns.length > 0) {
     setEverCheckedRuns((prev) => [...prev, ...newlyCheckedRuns]);
@@ -576,30 +837,21 @@ export function App() {
     });
   }
 
-  // Raw count of checked runs, independent of `combinedWorkspace`: used to
-  // gate both toggles below without either one disabling itself once it
-  // takes effect (combining reduces the *rendered* column count to 1, which
-  // must not turn around and disable the very checkbox that caused it).
-  // `checkedRuns.size` rather than counting `columns` below, so it's ready
-  // before `columns` needs it.
+  // Raw checked count, so turning Combine on (one rendered column) never disables its own checkbox.
   const activeColumnCount = checkedRuns.size;
 
-  // The "Combine into one workspace" checkbox stays checked (and the toggle
-  // itself never resets) once dropping to one checked run leaves nothing to
-  // combine with - only its *effect* on rendering switches off, so
-  // re-checking a second run resumes combined mode with no extra click.
+  // The checkbox keeps its value below two runs; only its effect switches off.
   const effectiveCombinedWorkspace = combinedWorkspace && activeColumnCount >= 2;
 
-  // One ViewerColumn per ever-checked run, in first-checked order (`isPrimary`
-  // is true only for index 0). `active` only drives CSS visibility; a column,
-  // once created, is never removed from this list, so unchecking a run just
-  // hides it instead of losing its state.
-  const columns = everCheckedRuns.map((run, index) => {
+  // The first-checked run that is still checked.
+  const primaryRun = everCheckedRuns.find((run) => checkedRuns.has(run));
+
+  const columns = everCheckedRuns.map((run) => {
     const caseName = selectedCaseByRun.get(run);
     const selection: Selection | null = caseName !== undefined ? { run, case: caseName } : null;
     const caseMeta = selection ? cases?.[selection.run]?.[selection.case] : undefined;
     const active = checkedRuns.has(run);
-    const isPrimary = index === 0;
+    const isPrimary = run === primaryRun;
     return {
       run,
       color: runColors.get(run) ?? RUN_COLOR_PALETTE[0],
@@ -607,17 +859,18 @@ export function App() {
       caseMeta,
       active,
       isPrimary,
-      // In combined-workspace mode, every other active run's data folds into
-      // the primary column as an overlay (see `overlayRunsForPrimary`), so
-      // only the primary itself gets a rendered column and sidebar controls.
+      // In combined mode every other active run folds into the primary column.
       showAsColumn: active && (!effectiveCombinedWorkspace || isPrimary),
     };
   });
 
-  // The only place theme token values are actually written, as CSS custom
-  // properties. Every other style constant just references the matching
-  // `var(--tb-*)` string, so the CSS cascade propagates color changes
-  // automatically without recomputing anything else when `isDark` changes.
+  // LRU over hidden columns (setState-during-render; converges once shown runs lead the list).
+  const shownRuns = columns.filter((column) => column.showAsColumn).map((column) => column.run);
+  const nextRecentRuns = [...shownRuns, ...recentRuns.filter((run) => !shownRuns.includes(run))];
+  if (nextRecentRuns.join('\n') !== recentRuns.join('\n')) setRecentRuns(nextRecentRuns);
+  const liveRuns = new Set(nextRecentRuns.slice(0, Math.max(MAX_LIVE_COLUMNS, shownRuns.length)));
+
+  // The only place theme values are written; styles reference `var(--tb-*)`.
   const rootVarStyle: CSSPropertiesWithVars = {
     ...rootStyle,
     '--tb-bg': themeTokens.background,
@@ -632,23 +885,11 @@ export function App() {
     '--tb-error': themeTokens.error,
   };
 
-  // Every active run gets its own inline expanded panel in the sidebar's
-  // Runs list (see CaseBrowser.tsx) - including an overlay run in
-  // combined-workspace mode: its layers portal into its OWN row's
-  // container (see `overlayContainersForPrimary` below), never into the
-  // primary's, so combining runs on the canvas never combines their entries
-  // in the sidebar.
+  // Every active run gets its own expanded panel in the Runs list, overlays included.
   const activeControlsRuns = new Set(columns.filter((column) => column.active).map((column) => column.run));
 
-  // Every other active, case-selected run gets folded into the primary
-  // column's own WASM instance as an overlay instead of its own column - and
-  // shows the *primary's* case name there (CaseViewer loads every source
-  // under one shared case name), not whatever case that run itself has
-  // selected. `cases` (already fetched) is looked up directly under that
-  // shared name to seed the overlay's layer list instantly instead of
-  // leaving it empty until CaseViewer's own first poll tick fills it in -
-  // `column.caseMeta` would be the wrong data here, since it's keyed by each
-  // run's own selection, not the primary's.
+  // Other active, case-selected runs load into the primary column under the
+  // primary's case name, seeded from `cases` under that name.
   const primaryCaseName = columns.find((column) => column.isPrimary)?.selection?.case;
   const overlayRunsForPrimary: OverlayRun[] = effectiveCombinedWorkspace
     ? columns
@@ -660,26 +901,82 @@ export function App() {
           initialSteps: primaryCaseName ? cases?.[column.run]?.[primaryCaseName]?.steps : undefined,
         }))
     : [];
-  // Each overlay's own sidebar container (registered under its own run name,
-  // same as any other active run - see `activeControlsRuns` above), so
-  // CaseViewer can portal that overlay's layers there instead of into the
-  // primary's container.
+  // Each overlay's layers go to its own row's container, not the primary's.
   const overlayContainersForPrimary = new Map(
-    overlayRunsForPrimary.map((o) => [o.run, controlsContainersRef.current.get(o.run) ?? null]),
+    overlayRunsForPrimary.map((o) => [o.run, controlsContainers.get(o.run) ?? null]),
   );
 
-  // Both camera/workspace toggles, as one block: rendered inside the
-  // always-visible "Viewer Control" section (see render site below), not
-  // conditionally repositioned, so the control governing the shared camera
-  // stays visible in a fixed spot regardless of how many runs are checked.
+  const sharedColumnProps: SharedColumnProps | null =
+    licenseToken === undefined
+      ? null
+      : {
+          isDark,
+          licenseToken,
+          linkCameras,
+          hiddenViews,
+          layoutRestoreToken,
+          onMenuHideView: handleMenuHideView,
+          onMaximizedChange: handleMaximizedChange,
+        };
+
+  // The "2D image" toggle only matters when some shown case has an image layer.
+  const anyImageLayer = columns.some(
+    (column) => column.active && column.caseMeta?.layers.some((meta) => meta.kind === 'image'),
+  );
+
+  // Shown columns with a maximized pane; a checked pane is off screen if every shown column maximizes another.
+  const shownColumns = columns.filter((column) => column.showAsColumn);
+  const maximizedColumns = shownColumns.flatMap((column) => {
+    const name = maximizedByRun.get(column.run);
+    return name ? [{ run: column.run, name }] : [];
+  });
+  const isOnScreen = (name: ViewName) =>
+    shownColumns.some((column) => (maximizedByRun.get(column.run) ?? name) === name);
+  const labelOf = (name: ViewName) => VIEWS.find((spec) => spec.name === name)?.label ?? name;
+
+  const viewToggleRow = (
+    <div style={viewToggleRowStyle}>
+      {VIEWS.filter((spec) => spec.name !== '2d' || anyImageLayer || hiddenViews.has('2d')).map((spec) => {
+        const maximizedHere = maximizedColumns.some((m) => m.name === spec.name);
+        const offScreen = !hiddenViews.has(spec.name) && maximizedColumns.length > 0 && !isOnScreen(spec.name);
+        return (
+          <label
+            key={spec.name}
+            style={offScreen ? viewToggleLabelOffStyle : viewToggleLabelStyle}
+            title={maximizedHere ? 'Maximized' : offScreen ? 'Hidden while another pane is maximized' : undefined}
+          >
+            <input
+              type="checkbox"
+              checked={!hiddenViews.has(spec.name)}
+              onChange={(e) => handleToggleView(spec.name, e.target.checked)}
+            />
+            {spec.label}
+            {maximizedHere && ' ⤢'}
+          </label>
+        );
+      })}
+      <button
+        type="button"
+        style={maximizedColumns.length > 0 ? restoreLayoutButtonActiveStyle : restoreLayoutButtonStyle}
+        title="Un-maximize any pane maximized with its ⤢ corner button, in every column"
+        onClick={() => setLayoutRestoreToken((n) => n + 1)}
+      >
+        Restore layout
+      </button>
+      {maximizedColumns.length > 0 && (
+        <div style={maximizedHintStyle}>
+          {maximizedColumns
+            .map((m) => (shownColumns.length > 1 ? `${labelOf(m.name)} (${m.run})` : labelOf(m.name)))
+            .join(', ')}{' '}
+          maximized. Restore layout, or change a pane above, to show the others.
+        </div>
+      )}
+    </div>
+  );
+
   const cameraControls = (
     <>
-      {/*
-        Disabled rather than hidden below two visible columns: hiding it
-        would leave the setting in force with no way to see or change it.
-        Also disabled in combined-workspace mode, where only one column
-        (and so one 3D camera) is ever rendered.
-      */}
+      {/* Disabled, not hidden, so a setting in force is always visible. */}
       <label style={linkCamerasRowStyle} title="Orbiting one run's 3D view moves every other column showing the same case">
         <input
           type="checkbox"
@@ -692,13 +989,6 @@ export function App() {
         </span>
       </label>
 
-      {/*
-        Disabled rather than hidden below two checked runs, matching "Link
-        3D cameras" above: hiding it would leave the setting in force with
-        no way to see or change it. Uses the raw checked-run count, not
-        `linkCameras`'s (possibly combined-reduced) visible count, so
-        turning this on never disables itself.
-      */}
       <label
         style={linkCamerasRowStyle}
         title="Show every checked run's layers together in one shared viewer, colored per run, instead of separate side-by-side columns"
@@ -717,24 +1007,14 @@ export function App() {
   return (
     <div style={rootVarStyle}>
       <aside style={sidebarStyle}>
-        {/* Title and About button: only two children, so plain space-between works. */}
         <div style={sidebarHeaderStyle}>
           <h1 style={titleStyle}>ImFusion Viewer</h1>
           <AboutButton isDark={isDark} />
         </div>
 
-        {/*
-          The shared view-toggle row (Axial/Coronal/Sagittal/3D) and the
-          camera/workspace checkboxes portal in/render here, always - both
-          combined and side-by-side - instead of sitting under the primary
-          run's own row like the rest of its controls, since that reads
-          oddly tucked under just one run's name and would otherwise jump in
-          and out of the sidebar every time "Combine into one workspace" is
-          toggled. A fixed, always-visible section keeps the sidebar's
-          layout stable regardless of that setting.
-        */}
+        {/* Fixed spot for the shared view toggles and camera/workspace options, in every mode. */}
         <CollapsibleSection label="Viewer Control">
-          <div ref={registerViewToggleContainer} style={viewToggleContainerStyle} />
+          {viewToggleRow}
           {cameraControls}
         </CollapsibleSection>
 
@@ -752,43 +1032,31 @@ export function App() {
           />
         </CollapsibleSection>
 
-        {/*
-          Exactly one DockedMetrics instance, always mounted in the sidebar
-          rather than nested in any one column, so it stays visible for all
-          checked runs even if a particular column is hidden. It manages its
-          own collapsible section header (see DockedMetrics.tsx), matching
-          CollapsibleSection's look, so it needs no wrapper here.
-        */}
         <DockedMetrics data={metricsData} currentStep={primaryCurrentStep} />
       </aside>
 
       <main style={mainStyle}>
-        {/*
-          Every checked run's canvas tree stays mounted; only CSS visibility
-          toggles, never conditional rendering, since WASM init is expensive
-          and unmounting would lose CaseViewer's loaded state. A CSS grid lets
-          columns reflow into multiple rows instead of squeezing narrower.
-        */}
+        {/* Hidden columns stay mounted (display:none) up to MAX_LIVE_COLUMNS. */}
         <div style={viewerContainerStyle}>
-          {licenseToken !== undefined &&
-            columns.map(({ run, color, selection, caseMeta, showAsColumn, isPrimary }) => (
-              <div key={run} style={showAsColumn ? columnVisibleStyle : columnHiddenStyle}>
-                <ViewerColumn
-                  run={run}
-                  color={color}
-                  isDark={isDark}
-                  licenseToken={licenseToken}
-                  linkCameras={linkCameras}
-                  selection={selection}
-                  caseMeta={caseMeta}
-                  overlayRuns={isPrimary ? overlayRunsForPrimary : []}
-                  overlayControlsContainers={isPrimary ? overlayContainersForPrimary : undefined}
-                  viewToggleContainer={isPrimary ? viewToggleContainerRef.current : null}
-                  onCurrentStepChange={isPrimary ? setPrimaryCurrentStep : undefined}
-                  controlsContainer={showAsColumn ? (controlsContainersRef.current.get(run) ?? null) : null}
-                />
-              </div>
-            ))}
+          {sharedColumnProps &&
+            columns
+              .filter(({ run }) => liveRuns.has(run))
+              .map(({ run, color, selection, caseMeta, showAsColumn, isPrimary }) => (
+                <div key={run} style={showAsColumn ? columnVisibleStyle : columnHiddenStyle}>
+                  <ViewerColumn
+                    {...sharedColumnProps}
+                    run={run}
+                    color={color}
+                    visible={showAsColumn}
+                    selection={selection}
+                    caseMeta={caseMeta}
+                    overlayRuns={isPrimary ? overlayRunsForPrimary : []}
+                    overlayControlsContainers={isPrimary ? overlayContainersForPrimary : undefined}
+                    onCurrentStepChange={isPrimary ? setPrimaryCurrentStep : undefined}
+                    controlsContainer={showAsColumn ? (controlsContainers.get(run) ?? null) : null}
+                  />
+                </div>
+              ))}
         </div>
       </main>
     </div>
@@ -824,7 +1092,9 @@ const sidebarStyle: CSSProperties = {
   // consistently one shade off from its main content area, in both themes.
   background: 'var(--tb-sidebar-bg)',
   borderRight: '1px solid var(--tb-border)',
+  // The sidebar's single scroll container (sections don't scroll on their own).
   overflowY: 'auto',
+  overscrollBehavior: 'contain',
 };
 
 // Sidebar's top title row: title on the left, About button on the right.
@@ -856,11 +1126,50 @@ const linkCamerasLabelDisabledStyle: CSSProperties = {
   opacity: 0.45,
 };
 
-// Portal target for the shared view-toggle row while combined (see render
-// site above) - just enough margin to separate it from the camera checkboxes
-// above and the Runs list below.
-const viewToggleContainerStyle: CSSProperties = {
+// Pane toggles; wraps so the labels fit the sidebar width.
+const viewToggleRowStyle: CSSProperties = {
+  display: 'flex',
+  flexWrap: 'wrap',
+  alignItems: 'center',
+  gap: '4px 10px',
   marginBottom: 4,
+};
+
+const viewToggleLabelStyle: CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 4,
+  opacity: 0.85,
+  cursor: 'pointer',
+};
+
+const viewToggleLabelOffStyle: CSSProperties = {
+  ...viewToggleLabelStyle,
+  opacity: 0.45,
+};
+
+const restoreLayoutButtonStyle: CSSProperties = {
+  font: 'inherit',
+  fontSize: '0.85em',
+  padding: 0,
+  border: 'none',
+  background: 'transparent',
+  color: 'inherit',
+  opacity: 0.6,
+  cursor: 'pointer',
+  textDecoration: 'underline',
+};
+
+const restoreLayoutButtonActiveStyle: CSSProperties = {
+  ...restoreLayoutButtonStyle,
+  opacity: 1,
+  color: 'var(--tb-accent)',
+};
+
+const maximizedHintStyle: CSSProperties = {
+  flexBasis: '100%',
+  fontSize: '0.85em',
+  opacity: 0.7,
 };
 
 const mainStyle: CSSProperties = {
@@ -870,7 +1179,11 @@ const mainStyle: CSSProperties = {
   flexDirection: 'column',
 };
 
+// Absolutely positioned so the canvas's own pixel size never props up the
+// grid cell; its CSS size always follows the cell, so autoResize sees shrinks too.
 const canvasStyle: CSSProperties = {
+  position: 'absolute',
+  inset: 0,
   width: '100%',
   height: '100%',
   display: 'block',
@@ -902,7 +1215,7 @@ const columnVisibleStyle: CSSProperties = {
   overflow: 'hidden',
 };
 
-// A column whose run is unchecked: hidden via CSS only, never unmounted.
+// A hidden column (unchecked, or folded into the primary in combined mode).
 // `display: none` grid items don't leave gaps in the layout.
 const columnHiddenStyle: CSSProperties = {
   display: 'none',
@@ -968,6 +1281,8 @@ const canvasContainerStyle: CSSProperties = {
   width: '100%',
   flex: 1,
   minHeight: 0,
+  minWidth: 0,
+  overflow: 'hidden',
   background: 'var(--tb-canvas-bg)',
 };
 
@@ -990,13 +1305,9 @@ const exportButtonStyle: CSSProperties = {
 };
 
 const panelEmptyStyle: CSSProperties = {
-  minHeight: 160,
-  display: 'flex',
-  alignItems: 'center',
-  justifyContent: 'center',
-  padding: 24,
+  padding: '4px 0',
+  fontSize: 13,
   opacity: 0.55,
-  textAlign: 'center',
 };
 
 const centerMsgStyle: CSSProperties = {
@@ -1017,4 +1328,18 @@ const centerMsgStyle: CSSProperties = {
 const centerErrorStyle: CSSProperties = {
   ...centerMsgStyle,
   color: 'var(--tb-error)',
+};
+
+const contextLostStyle: CSSProperties = {
+  ...centerMsgStyle,
+  flexDirection: 'column',
+  gap: 10,
+  opacity: 1,
+  background: 'var(--tb-canvas-bg)',
+};
+
+const reloadButtonStyle: CSSProperties = {
+  ...exportButtonStyle,
+  width: 'auto',
+  padding: '6px 16px',
 };

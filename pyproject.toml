@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "imfusion-tensorboard"
-version = "0.1.1"
+version = "0.1.2"
 description = "TensorBoard plugin for viewing ImFusion spatial training outputs (volumes, segmentation masks, meshes, 2D images) organized as named cases and layers, rendered via ImFusion's WebSDK."
 readme = "README.md"
 requires-python = ">=3.10"
